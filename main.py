@@ -18,7 +18,7 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL não configurada no ambiente")
 
-# URL da API externa que recebe a OS no novo formato
+# URL da API externa
 INTEGRACAO_OUTRA_API_URL = os.getenv(
     "INTEGRACAO_OUTRA_API_URL",
     "https://sua-outra-api.onrender.com/os-corretiva",
@@ -49,12 +49,24 @@ class OrdemServico(Base):
     __tablename__ = "ordens_servico"
 
     id = Column(Integer, primary_key=True, index=True)
-    veiculo = Column(String(255), nullable=False)
+
+    usuario = Column(String(255), nullable=True)
+    filial_login = Column(String(255), nullable=True)
+    cd_empresa = Column(String(100), nullable=True)
+    cd_veiculo = Column(String(100), nullable=True)
     placa = Column(String(50), nullable=True)
-    mecanico_nome = Column(String(255), nullable=False)
-    servicos_realizados = Column(Text, nullable=True)
+    dh_entrada = Column(String(100), nullable=True)
+    km_entrada = Column(String(100), nullable=True)
+    dh_saida = Column(String(100), nullable=True)
+    km_saida = Column(String(100), nullable=True)
+    dh_inicio = Column(String(100), nullable=True)
+    dh_prev = Column(String(100), nullable=True)
+    cd_filial = Column(String(100), nullable=True)
+    cd_ccusto = Column(String(100), nullable=True)
     observacao = Column(Text, nullable=True)
-    data_execucao = Column(DateTime(timezone=True), nullable=False)
+    cd_servico = Column(String(100), nullable=True)
+    cd_servicos = Column(Text, nullable=True)
+    try_out = Column(String(255), nullable=True)
 
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(
@@ -82,12 +94,13 @@ def render_html(ordens, filtros):
         linhas += f'''
         <tr>
             <td>{item.id}</td>
-            <td>{item.veiculo or ""}</td>
+            <td>{item.usuario or ""}</td>
             <td>{item.placa or ""}</td>
-            <td>{item.mecanico_nome or ""}</td>
-            <td>{item.servicos_realizados or ""}</td>
+            <td>{item.cd_veiculo or ""}</td>
+            <td>{item.cd_filial or ""}</td>
+            <td>{item.cd_servico or ""}</td>
+            <td>{item.try_out or ""}</td>
             <td>{item.observacao or ""}</td>
-            <td>{item.data_execucao.strftime("%d/%m/%Y %H:%M") if item.data_execucao else ""}</td>
             <td>{item.created_at.strftime("%d/%m/%Y %H:%M") if item.created_at else ""}</td>
         </tr>
         '''
@@ -107,7 +120,7 @@ def render_html(ordens, filtros):
                 padding: 24px;
             }}
             .container {{
-                max-width: 1400px;
+                max-width: 1600px;
                 margin: 0 auto;
             }}
             h1 {{
@@ -222,27 +235,27 @@ def render_html(ordens, filtros):
                 <form method="get" action="/painel/ordens-servico">
                     <div class="filtros">
                         <div>
-                            <label>Data início</label>
-                            <input type="datetime-local" name="data_inicio" value="{filtros.get("data_inicio", "")}">
-                        </div>
-                        <div>
-                            <label>Data fim</label>
-                            <input type="datetime-local" name="data_fim" value="{filtros.get("data_fim", "")}">
-                        </div>
-                        <div>
-                            <label>Mecânico</label>
-                            <input type="text" name="mecanico_nome" value="{filtros.get("mecanico_nome", "")}">
+                            <label>Usuário</label>
+                            <input type="text" name="usuario" value="{filtros.get("usuario", "")}">
                         </div>
                         <div>
                             <label>Placa</label>
                             <input type="text" name="placa" value="{filtros.get("placa", "")}">
                         </div>
+                        <div>
+                            <label>Código do veículo</label>
+                            <input type="text" name="cd_veiculo" value="{filtros.get("cd_veiculo", "")}">
+                        </div>
+                        <div>
+                            <label>Try Out</label>
+                            <input type="text" name="try_out" value="{filtros.get("try_out", "")}">
+                        </div>
                     </div>
 
                     <div class="acoes">
                         <button type="submit">Filtrar</button>
-                        <a class="btn btn-secondary" href="/painel/ordens-servico/exportar/xlsx?data_inicio={filtros.get("data_inicio_iso", "")}&data_fim={filtros.get("data_fim_iso", "")}&mecanico_nome={filtros.get("mecanico_nome", "")}&placa={filtros.get("placa", "")}">Exportar XLSX</a>
-                        <a class="btn btn-json" href="/painel/ordens-servico/exportar/json?data_inicio={filtros.get("data_inicio_iso", "")}&data_fim={filtros.get("data_fim_iso", "")}&mecanico_nome={filtros.get("mecanico_nome", "")}&placa={filtros.get("placa", "")}">Exportar JSON</a>
+                        <a class="btn btn-secondary" href="/painel/ordens-servico/exportar/xlsx?usuario={filtros.get("usuario", "")}&placa={filtros.get("placa", "")}&cd_veiculo={filtros.get("cd_veiculo", "")}&try_out={filtros.get("try_out", "")}">Exportar XLSX</a>
+                        <a class="btn btn-json" href="/painel/ordens-servico/exportar/json?usuario={filtros.get("usuario", "")}&placa={filtros.get("placa", "")}&cd_veiculo={filtros.get("cd_veiculo", "")}&try_out={filtros.get("try_out", "")}">Exportar JSON</a>
                     </div>
                 </form>
             </div>
@@ -252,17 +265,18 @@ def render_html(ordens, filtros):
                     <thead>
                         <tr>
                             <th>ID</th>
-                            <th>Veículo</th>
+                            <th>Usuário</th>
                             <th>Placa</th>
-                            <th>Mecânico</th>
-                            <th>Serviços Realizados</th>
+                            <th>CD Veículo</th>
+                            <th>CD Filial</th>
+                            <th>CD Serviço</th>
+                            <th>Try Out</th>
                             <th>Observação</th>
-                            <th>Data Execução</th>
                             <th>Criado em</th>
                         </tr>
                     </thead>
                     <tbody>
-                        {linhas if linhas else '<tr><td colspan="8">Nenhum registro encontrado</td></tr>'}
+                        {linhas if linhas else '<tr><td colspan="9">Nenhum registro encontrado</td></tr>'}
                     </tbody>
                 </table>
             </div>
@@ -276,49 +290,26 @@ def render_html(ordens, filtros):
 # HELPERS
 # =========================================================
 
-def parse_datetime_local(value: Optional[str]) -> Optional[datetime]:
-    if not value:
-        return None
-
-    formatos = [
-        "%Y-%m-%dT%H:%M",
-        "%Y-%m-%dT%H:%M:%S",
-        "%Y-%m-%d %H:%M:%S",
-        "%Y-%m-%d",
-    ]
-
-    for fmt in formatos:
-        try:
-            return datetime.strptime(value, fmt)
-        except ValueError:
-            continue
-
-    try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except Exception:
-        return None
-
-
 def aplicar_filtros(
     query,
-    data_inicio: Optional[datetime],
-    data_fim: Optional[datetime],
-    mecanico_nome: Optional[str],
+    usuario: Optional[str],
     placa: Optional[str],
+    cd_veiculo: Optional[str],
+    try_out: Optional[str],
 ):
     query = query.filter(OrdemServico.deleted_at.is_(None))
 
-    if data_inicio:
-        query = query.filter(OrdemServico.data_execucao >= data_inicio)
-
-    if data_fim:
-        query = query.filter(OrdemServico.data_execucao <= data_fim)
-
-    if mecanico_nome:
-        query = query.filter(OrdemServico.mecanico_nome.ilike(f"%{mecanico_nome}%"))
+    if usuario:
+        query = query.filter(OrdemServico.usuario.ilike(f"%{usuario}%"))
 
     if placa:
         query = query.filter(OrdemServico.placa.ilike(f"%{placa}%"))
+
+    if cd_veiculo:
+        query = query.filter(OrdemServico.cd_veiculo.ilike(f"%{cd_veiculo}%"))
+
+    if try_out:
+        query = query.filter(OrdemServico.try_out.ilike(f"%{try_out}%"))
 
     return query
 
@@ -329,31 +320,34 @@ def to_str(value, default=""):
     return str(value).strip()
 
 
-def montar_payload_outra_api(dados: dict) -> dict:
-    payload = dados.get("payload_outra_api") or {}
+def normalize_cd_servicos(value):
+    if isinstance(value, list):
+        return value
+    if value is None:
+        return []
+    return [str(value).strip()]
 
-    # aceita try_out tanto na raiz quanto dentro do payload_outra_api
-    try_out = dados.get("try_out", payload.get("try_out", ""))
 
+def montar_payload(dados: dict) -> dict:
     return {
-        "usuario": to_str(payload.get("usuario")),
-        "senha": to_str(payload.get("senha")),
-        "filial_login": to_str(payload.get("filial_login")),
-        "cd_empresa": to_str(payload.get("cd_empresa")),
-        "cd_veiculo": to_str(payload.get("cd_veiculo")),
-        "placa": to_str(payload.get("placa", dados.get("placa"))),
-        "dh_entrada": to_str(payload.get("dh_entrada")),
-        "km_entrada": to_str(payload.get("km_entrada")),
-        "dh_saida": to_str(payload.get("dh_saida")),
-        "km_saida": to_str(payload.get("km_saida")),
-        "dh_inicio": to_str(payload.get("dh_inicio")),
-        "dh_prev": to_str(payload.get("dh_prev")),
-        "cd_filial": to_str(payload.get("cd_filial")),
-        "cd_ccusto": to_str(payload.get("cd_ccusto")),
-        "observacao": to_str(payload.get("observacao", dados.get("observacao", ""))),
-        "cd_servico": to_str(payload.get("cd_servico")),
-        "cd_servicos": payload.get("cd_servicos", []),
-        "try_out": try_out,
+        "usuario": to_str(dados.get("usuario")),
+        "senha": to_str(dados.get("senha")),
+        "filial_login": to_str(dados.get("filial_login")),
+        "cd_empresa": to_str(dados.get("cd_empresa")),
+        "cd_veiculo": to_str(dados.get("cd_veiculo")),
+        "placa": to_str(dados.get("placa")),
+        "dh_entrada": to_str(dados.get("dh_entrada")),
+        "km_entrada": to_str(dados.get("km_entrada")),
+        "dh_saida": to_str(dados.get("dh_saida")),
+        "km_saida": to_str(dados.get("km_saida")),
+        "dh_inicio": to_str(dados.get("dh_inicio")),
+        "dh_prev": to_str(dados.get("dh_prev")),
+        "cd_filial": to_str(dados.get("cd_filial")),
+        "cd_ccusto": to_str(dados.get("cd_ccusto")),
+        "observacao": dados.get("observacao", ""),
+        "cd_servico": to_str(dados.get("cd_servico")),
+        "cd_servicos": normalize_cd_servicos(dados.get("cd_servicos")),
+        "try_out": to_str(dados.get("try_out")),
     }
 
 
@@ -376,10 +370,9 @@ def enviar_para_outra_api(payload: dict):
         raise HTTPException(
             status_code=resp.status_code,
             detail={
-                "message": "Erro retornado pela outra API",
                 "payload_enviado": payload,
                 "retorno": retorno,
-            },
+            }
         )
 
     return retorno
@@ -402,23 +395,6 @@ def health():
     return {"status": "ok"}
 
 
-@app.post("/integracoes/outra-api/os-corretiva")
-async def integrar_outra_api(request: Request):
-    try:
-        dados = await request.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail="JSON inválido")
-
-    payload = montar_payload_outra_api(dados)
-    retorno = enviar_para_outra_api(payload)
-
-    return {
-        "ok": True,
-        "payload_enviado": payload,
-        "retorno_integracao": retorno,
-    }
-
-
 @app.post("/ordens-servico")
 async def criar_ordem_servico(request: Request, db: Session = Depends(get_db)):
     try:
@@ -426,93 +402,79 @@ async def criar_ordem_servico(request: Request, db: Session = Depends(get_db)):
     except Exception:
         raise HTTPException(status_code=400, detail="JSON inválido")
 
-    veiculo = to_str(dados.get("veiculo"))
-    placa = to_str(dados.get("placa"))
-    mecanico_nome = to_str(dados.get("mecanico_nome"))
-    servicos_realizados = to_str(dados.get("servicos_realizados"))
-    observacao = to_str(dados.get("observacao"))
-    data_execucao_raw = dados.get("data_execucao")
-
-    if not veiculo:
-        raise HTTPException(status_code=400, detail="Campo veiculo é obrigatório")
-
-    if not mecanico_nome:
-        raise HTTPException(status_code=400, detail="Campo mecanico_nome é obrigatório")
-
-    if not data_execucao_raw:
-        raise HTTPException(status_code=400, detail="Campo data_execucao é obrigatório")
+    payload = montar_payload(dados)
 
     try:
-        data_execucao = datetime.fromisoformat(str(data_execucao_raw).replace("Z", "+00:00"))
-    except Exception:
-        raise HTTPException(status_code=400, detail="data_execucao inválida")
+        retorno_integracao = enviar_para_outra_api(payload)
+    except HTTPException as e:
+        raise HTTPException(status_code=e.status_code, detail=e.detail)
 
     nova = OrdemServico(
-        veiculo=veiculo,
-        placa=placa,
-        mecanico_nome=mecanico_nome,
-        servicos_realizados=servicos_realizados,
-        observacao=observacao,
-        data_execucao=data_execucao,
+        usuario=payload["usuario"],
+        filial_login=payload["filial_login"],
+        cd_empresa=payload["cd_empresa"],
+        cd_veiculo=payload["cd_veiculo"],
+        placa=payload["placa"],
+        dh_entrada=payload["dh_entrada"],
+        km_entrada=payload["km_entrada"],
+        dh_saida=payload["dh_saida"],
+        km_saida=payload["km_saida"],
+        dh_inicio=payload["dh_inicio"],
+        dh_prev=payload["dh_prev"],
+        cd_filial=payload["cd_filial"],
+        cd_ccusto=payload["cd_ccusto"],
+        observacao=payload["observacao"],
+        cd_servico=payload["cd_servico"],
+        cd_servicos=",".join(payload["cd_servicos"]),
+        try_out=payload["try_out"],
     )
 
     db.add(nova)
     db.commit()
     db.refresh(nova)
 
-    enviar_integracao = dados.get("enviar_para_outra_api", False)
-    payload_outra_api = dados.get("payload_outra_api")
-
-    if enviar_integracao or payload_outra_api:
-        payload = montar_payload_outra_api(dados)
-
-        try:
-            retorno_integracao = enviar_para_outra_api(payload)
-            return {
-                "id": nova.id,
-                "message": "Ordem de serviço criada com sucesso e enviada para a outra API",
-                "payload_enviado": payload,
-                "integracao": retorno_integracao,
-            }
-        except HTTPException as e:
-            return {
-                "id": nova.id,
-                "message": "Ordem criada localmente, mas a integração falhou",
-                "payload_enviado": payload,
-                "erro_integracao": e.detail,
-            }
-
     return {
+        "ok": True,
         "id": nova.id,
-        "message": "Ordem de serviço criada com sucesso",
+        "message": "Ordem de serviço criada com sucesso e enviada para a outra API",
+        "payload_enviado": payload,
+        "retorno_integracao": retorno_integracao,
     }
 
 
 @app.get("/ordens-servico")
 def listar_ordens_servico(
-    data_inicio: Optional[str] = Query(None),
-    data_fim: Optional[str] = Query(None),
-    mecanico_nome: Optional[str] = Query(None),
+    usuario: Optional[str] = Query(None),
     placa: Optional[str] = Query(None),
+    cd_veiculo: Optional[str] = Query(None),
+    try_out: Optional[str] = Query(None),
     db: Session = Depends(get_db),
 ):
-    dt_inicio = parse_datetime_local(data_inicio)
-    dt_fim = parse_datetime_local(data_fim)
-
     query = db.query(OrdemServico)
-    query = aplicar_filtros(query, dt_inicio, dt_fim, mecanico_nome, placa)
+    query = aplicar_filtros(query, usuario, placa, cd_veiculo, try_out)
 
-    registros = query.order_by(OrdemServico.data_execucao.desc()).all()
+    registros = query.order_by(OrdemServico.created_at.desc()).all()
 
     return [
         {
             "id": item.id,
-            "veiculo": item.veiculo,
+            "usuario": item.usuario,
+            "filial_login": item.filial_login,
+            "cd_empresa": item.cd_empresa,
+            "cd_veiculo": item.cd_veiculo,
             "placa": item.placa,
-            "mecanico_nome": item.mecanico_nome,
-            "servicos_realizados": item.servicos_realizados,
+            "dh_entrada": item.dh_entrada,
+            "km_entrada": item.km_entrada,
+            "dh_saida": item.dh_saida,
+            "km_saida": item.km_saida,
+            "dh_inicio": item.dh_inicio,
+            "dh_prev": item.dh_prev,
+            "cd_filial": item.cd_filial,
+            "cd_ccusto": item.cd_ccusto,
             "observacao": item.observacao,
-            "data_execucao": item.data_execucao.isoformat() if item.data_execucao else None,
+            "cd_servico": item.cd_servico,
+            "cd_servicos": item.cd_servicos.split(",") if item.cd_servicos else [],
+            "try_out": item.try_out,
             "created_at": item.created_at.isoformat() if item.created_at else None,
             "updated_at": item.updated_at.isoformat() if item.updated_at else None,
         }
@@ -522,26 +484,21 @@ def listar_ordens_servico(
 
 @app.get("/painel/ordens-servico", response_class=HTMLResponse)
 def painel_ordens_servico(
-    data_inicio: Optional[str] = Query(None),
-    data_fim: Optional[str] = Query(None),
-    mecanico_nome: Optional[str] = Query(None),
+    usuario: Optional[str] = Query(None),
     placa: Optional[str] = Query(None),
+    cd_veiculo: Optional[str] = Query(None),
+    try_out: Optional[str] = Query(None),
     db: Session = Depends(get_db),
 ):
-    dt_inicio = parse_datetime_local(data_inicio)
-    dt_fim = parse_datetime_local(data_fim)
-
     query = db.query(OrdemServico)
-    query = aplicar_filtros(query, dt_inicio, dt_fim, mecanico_nome, placa)
-    ordens = query.order_by(OrdemServico.data_execucao.desc()).all()
+    query = aplicar_filtros(query, usuario, placa, cd_veiculo, try_out)
+    ordens = query.order_by(OrdemServico.created_at.desc()).all()
 
     filtros = {
-        "data_inicio": data_inicio or "",
-        "data_fim": data_fim or "",
-        "data_inicio_iso": data_inicio or "",
-        "data_fim_iso": data_fim or "",
-        "mecanico_nome": mecanico_nome or "",
+        "usuario": usuario or "",
         "placa": placa or "",
+        "cd_veiculo": cd_veiculo or "",
+        "try_out": try_out or "",
     }
 
     return HTMLResponse(content=render_html(ordens, filtros))
@@ -549,29 +506,37 @@ def painel_ordens_servico(
 
 @app.get("/painel/ordens-servico/exportar/xlsx")
 def exportar_ordens_xlsx(
-    data_inicio: Optional[str] = Query(None),
-    data_fim: Optional[str] = Query(None),
-    mecanico_nome: Optional[str] = Query(None),
+    usuario: Optional[str] = Query(None),
     placa: Optional[str] = Query(None),
+    cd_veiculo: Optional[str] = Query(None),
+    try_out: Optional[str] = Query(None),
     db: Session = Depends(get_db),
 ):
-    dt_inicio = parse_datetime_local(data_inicio)
-    dt_fim = parse_datetime_local(data_fim)
-
     query = db.query(OrdemServico)
-    query = aplicar_filtros(query, dt_inicio, dt_fim, mecanico_nome, placa)
-    registros = query.order_by(OrdemServico.data_execucao.desc()).all()
+    query = aplicar_filtros(query, usuario, placa, cd_veiculo, try_out)
+    registros = query.order_by(OrdemServico.created_at.desc()).all()
 
     dados = []
     for item in registros:
         dados.append({
             "ID": item.id,
-            "Veículo": item.veiculo,
+            "Usuário": item.usuario,
+            "Filial Login": item.filial_login,
+            "CD Empresa": item.cd_empresa,
+            "CD Veículo": item.cd_veiculo,
             "Placa": item.placa,
-            "Mecânico": item.mecanico_nome,
-            "Serviços Realizados": item.servicos_realizados,
+            "DH Entrada": item.dh_entrada,
+            "KM Entrada": item.km_entrada,
+            "DH Saída": item.dh_saida,
+            "KM Saída": item.km_saida,
+            "DH Início": item.dh_inicio,
+            "DH Prev": item.dh_prev,
+            "CD Filial": item.cd_filial,
+            "CD CCusto": item.cd_ccusto,
             "Observação": item.observacao,
-            "Data Execução": item.data_execucao.strftime("%d/%m/%Y %H:%M") if item.data_execucao else "",
+            "CD Serviço": item.cd_servico,
+            "CD Serviços": item.cd_servicos,
+            "Try Out": item.try_out,
             "Criado em": item.created_at.strftime("%d/%m/%Y %H:%M") if item.created_at else "",
         })
 
@@ -592,29 +557,37 @@ def exportar_ordens_xlsx(
 
 @app.get("/painel/ordens-servico/exportar/json")
 def exportar_ordens_json(
-    data_inicio: Optional[str] = Query(None),
-    data_fim: Optional[str] = Query(None),
-    mecanico_nome: Optional[str] = Query(None),
+    usuario: Optional[str] = Query(None),
     placa: Optional[str] = Query(None),
+    cd_veiculo: Optional[str] = Query(None),
+    try_out: Optional[str] = Query(None),
     db: Session = Depends(get_db),
 ):
-    dt_inicio = parse_datetime_local(data_inicio)
-    dt_fim = parse_datetime_local(data_fim)
-
     query = db.query(OrdemServico)
-    query = aplicar_filtros(query, dt_inicio, dt_fim, mecanico_nome, placa)
-    registros = query.order_by(OrdemServico.data_execucao.desc()).all()
+    query = aplicar_filtros(query, usuario, placa, cd_veiculo, try_out)
+    registros = query.order_by(OrdemServico.created_at.desc()).all()
 
     dados = []
     for item in registros:
         dados.append({
             "id": item.id,
-            "veiculo": item.veiculo,
+            "usuario": item.usuario,
+            "filial_login": item.filial_login,
+            "cd_empresa": item.cd_empresa,
+            "cd_veiculo": item.cd_veiculo,
             "placa": item.placa,
-            "mecanico_nome": item.mecanico_nome,
-            "servicos_realizados": item.servicos_realizados,
+            "dh_entrada": item.dh_entrada,
+            "km_entrada": item.km_entrada,
+            "dh_saida": item.dh_saida,
+            "km_saida": item.km_saida,
+            "dh_inicio": item.dh_inicio,
+            "dh_prev": item.dh_prev,
+            "cd_filial": item.cd_filial,
+            "cd_ccusto": item.cd_ccusto,
             "observacao": item.observacao,
-            "data_execucao": item.data_execucao.isoformat() if item.data_execucao else None,
+            "cd_servico": item.cd_servico,
+            "cd_servicos": item.cd_servicos.split(",") if item.cd_servicos else [],
+            "try_out": item.try_out,
             "created_at": item.created_at.isoformat() if item.created_at else None,
             "updated_at": item.updated_at.isoformat() if item.updated_at else None,
         })
