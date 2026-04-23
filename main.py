@@ -18,11 +18,10 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL não configurada no ambiente")
 
-# Configure no Render:
-# INTEGRACAO_FROTAWEB_URL=https://seu-servico.onrender.com/frotaweb/os-corretiva
-INTEGRACAO_FROTAWEB_URL = os.getenv(
-    "INTEGRACAO_FROTAWEB_URL",
-    "https://integracao-frotaweb.onrender.com/frotaweb/os-corretiva",
+# URL da API externa que recebe a OS no novo formato
+INTEGRACAO_OUTRA_API_URL = os.getenv(
+    "INTEGRACAO_OUTRA_API_URL",
+    "https://sua-outra-api.onrender.com/os-corretiva",
 )
 
 engine = create_engine(DATABASE_URL)
@@ -323,6 +322,68 @@ def aplicar_filtros(
 
     return query
 
+
+def to_str(value, default=""):
+    if value is None:
+        return default
+    return str(value).strip()
+
+
+def montar_payload_outra_api(dados: dict) -> dict:
+    payload = dados.get("payload_outra_api") or {}
+
+    # aceita try_out tanto na raiz quanto dentro do payload_outra_api
+    try_out = dados.get("try_out", payload.get("try_out", ""))
+
+    return {
+        "usuario": to_str(payload.get("usuario")),
+        "senha": to_str(payload.get("senha")),
+        "filial_login": to_str(payload.get("filial_login")),
+        "cd_empresa": to_str(payload.get("cd_empresa")),
+        "cd_veiculo": to_str(payload.get("cd_veiculo")),
+        "placa": to_str(payload.get("placa", dados.get("placa"))),
+        "dh_entrada": to_str(payload.get("dh_entrada")),
+        "km_entrada": to_str(payload.get("km_entrada")),
+        "dh_saida": to_str(payload.get("dh_saida")),
+        "km_saida": to_str(payload.get("km_saida")),
+        "dh_inicio": to_str(payload.get("dh_inicio")),
+        "dh_prev": to_str(payload.get("dh_prev")),
+        "cd_filial": to_str(payload.get("cd_filial")),
+        "cd_ccusto": to_str(payload.get("cd_ccusto")),
+        "observacao": to_str(payload.get("observacao", dados.get("observacao", ""))),
+        "cd_servico": to_str(payload.get("cd_servico")),
+        "cd_servicos": payload.get("cd_servicos", []),
+        "try_out": try_out,
+    }
+
+
+def enviar_para_outra_api(payload: dict):
+    try:
+        resp = requests.post(
+            INTEGRACAO_OUTRA_API_URL,
+            json=payload,
+            timeout=120,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erro ao conectar na outra API: {str(e)}")
+
+    try:
+        retorno = resp.json()
+    except Exception:
+        retorno = {"raw": resp.text}
+
+    if resp.status_code not in (200, 201):
+        raise HTTPException(
+            status_code=resp.status_code,
+            detail={
+                "message": "Erro retornado pela outra API",
+                "payload_enviado": payload,
+                "retorno": retorno,
+            },
+        )
+
+    return retorno
+
 # =========================================================
 # ROTAS
 # =========================================================
@@ -341,36 +402,19 @@ def health():
     return {"status": "ok"}
 
 
-@app.post("/integracoes/frotaweb/os-corretiva")
-async def integrar_frotaweb(request: Request):
+@app.post("/integracoes/outra-api/os-corretiva")
+async def integrar_outra_api(request: Request):
     try:
         dados = await request.json()
     except Exception:
         raise HTTPException(status_code=400, detail="JSON inválido")
 
-    try:
-        resp = requests.post(
-            INTEGRACAO_FROTAWEB_URL,
-            json=dados,
-            timeout=120,
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Erro ao conectar na integração: {str(e)}")
-
-    try:
-        retorno = resp.json()
-    except Exception:
-        raise HTTPException(status_code=500, detail="Erro ao interpretar resposta da integração")
-
-    if resp.status_code != 200:
-        raise HTTPException(status_code=resp.status_code, detail=retorno)
+    payload = montar_payload_outra_api(dados)
+    retorno = enviar_para_outra_api(payload)
 
     return {
         "ok": True,
-        "resumo": retorno.get("resumo"),
-        "resumo_texto": retorno.get("resumo_texto"),
-        "os": retorno.get("os"),
-        "servicos": retorno.get("servicos"),
+        "payload_enviado": payload,
         "retorno_integracao": retorno,
     }
 
@@ -382,11 +426,11 @@ async def criar_ordem_servico(request: Request, db: Session = Depends(get_db)):
     except Exception:
         raise HTTPException(status_code=400, detail="JSON inválido")
 
-    veiculo = str(dados.get("veiculo", "")).strip()
-    placa = str(dados.get("placa", "")).strip()
-    mecanico_nome = str(dados.get("mecanico_nome", "")).strip()
-    servicos_realizados = str(dados.get("servicos_realizados", "")).strip()
-    observacao = str(dados.get("observacao", "")).strip()
+    veiculo = to_str(dados.get("veiculo"))
+    placa = to_str(dados.get("placa"))
+    mecanico_nome = to_str(dados.get("mecanico_nome"))
+    servicos_realizados = to_str(dados.get("servicos_realizados"))
+    observacao = to_str(dados.get("observacao"))
     data_execucao_raw = dados.get("data_execucao")
 
     if not veiculo:
@@ -416,41 +460,31 @@ async def criar_ordem_servico(request: Request, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(nova)
 
-    payload_frotaweb = dados.get("payload_frotaweb")
-    if payload_frotaweb:
+    enviar_integracao = dados.get("enviar_para_outra_api", False)
+    payload_outra_api = dados.get("payload_outra_api")
+
+    if enviar_integracao or payload_outra_api:
+        payload = montar_payload_outra_api(dados)
+
         try:
-            resp = requests.post(
-                INTEGRACAO_FROTAWEB_URL,
-                json=payload_frotaweb,
-                timeout=120,
-            )
-            try:
-                retorno_integracao = resp.json()
-            except Exception:
-                retorno_integracao = {"raw": resp.text}
-
-            if resp.status_code == 200:
-                return {
-                    "id": nova.id,
-                    "message": "Ordem de serviço criada com sucesso",
-                    "integracao": retorno_integracao,
-                }
-
+            retorno_integracao = enviar_para_outra_api(payload)
             return {
                 "id": nova.id,
-                "message": "Ordem criada localmente, mas integração retornou erro",
-                "integracao_erro": retorno_integracao,
+                "message": "Ordem de serviço criada com sucesso e enviada para a outra API",
+                "payload_enviado": payload,
+                "integracao": retorno_integracao,
             }
-        except Exception as e:
+        except HTTPException as e:
             return {
                 "id": nova.id,
-                "message": "Ordem criada localmente, mas falhou a integração",
-                "erro_integracao": str(e),
+                "message": "Ordem criada localmente, mas a integração falhou",
+                "payload_enviado": payload,
+                "erro_integracao": e.detail,
             }
 
     return {
         "id": nova.id,
-        "message": "Ordem de serviço criada com sucesso"
+        "message": "Ordem de serviço criada com sucesso",
     }
 
 
