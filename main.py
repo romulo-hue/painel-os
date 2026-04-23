@@ -22,7 +22,7 @@ if not DATABASE_URL:
 # INTEGRACAO_FROTAWEB_URL=https://seu-servico.onrender.com/frotaweb/os-corretiva
 INTEGRACAO_FROTAWEB_URL = os.getenv(
     "INTEGRACAO_FROTAWEB_URL",
-    "https://SEU-SERVICO.onrender.com/frotaweb/os-corretiva",
+    "https://integracao-frotaweb.onrender.com/frotaweb/os-corretiva",
 )
 
 engine = create_engine(DATABASE_URL)
