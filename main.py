@@ -6,7 +6,7 @@ import pandas as pd
 import requests
 from fastapi import FastAPI, Depends, Query, Request, HTTPException, UploadFile, File
 from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse, RedirectResponse
-from sqlalchemy import create_engine, Column, Integer, String, DateTime, Text, func
+from sqlalchemy import create_engine, Column, Integer, String, DateTime, Text, func, or_
 from sqlalchemy.orm import sessionmaker, declarative_base, Session
 
 # =========================================================
@@ -15,7 +15,7 @@ from sqlalchemy.orm import sessionmaker, declarative_base, Session
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL não configurada no ambiente")
+    raise RuntimeError("DATABASE_URL nao configurada no ambiente")
 
 INTEGRACAO_OUTRA_API_URL = os.getenv(
     "INTEGRACAO_OUTRA_API_URL",
@@ -26,7 +26,7 @@ engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
-app = FastAPI(title="Painel de Ordens de Serviço")
+app = FastAPI(title="Painel de Ordens de Servico")
 
 # =========================================================
 # DATABASE
@@ -64,7 +64,6 @@ class OrdemServico(Base):
     cd_servico = Column(String(100), nullable=True)
     cd_servicos = Column(Text, nullable=True)
     try_out = Column(String(255), nullable=True)
-
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
     deleted_at = Column(DateTime(timezone=True), nullable=True)
@@ -90,6 +89,20 @@ class UsuarioApp(Base):
     cpf = Column(String(20), nullable=True)
     nome_completo = Column(String(255), nullable=False)
     funcao = Column(String(100), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class ServicoReferencia(Base):
+    __tablename__ = "servicos_referencia"
+
+    id = Column(Integer, primary_key=True, index=True)
+    cd_grpserv = Column(String(100), nullable=True)
+    cd_servico = Column(String(100), nullable=False, unique=True, index=True)
+    nm_servico = Column(String(255), nullable=False, index=True)
+    cd_empresa = Column(String(100), nullable=True)
+    bl_inativo = Column(String(20), nullable=True)
+    nm_grpserv = Column(String(255), nullable=True)
+    nm_empresa = Column(String(255), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 # =========================================================
@@ -168,10 +181,7 @@ def enviar_para_outra_api(payload: dict):
     if resp.status_code not in (200, 201):
         raise HTTPException(
             status_code=resp.status_code,
-            detail={
-                "payload_enviado": payload_api,
-                "retorno": retorno,
-            },
+            detail={"payload_enviado": payload_api, "retorno": retorno},
         )
 
     return retorno
@@ -179,25 +189,19 @@ def enviar_para_outra_api(payload: dict):
 
 def aplicar_filtros_ordens(query, usuario, placa, cd_veiculo, try_out):
     query = query.filter(OrdemServico.deleted_at.is_(None))
-
     if usuario:
         query = query.filter(OrdemServico.usuario.ilike(f"%{usuario}%"))
-
     if placa:
         query = query.filter(OrdemServico.placa.ilike(f"%{placa}%"))
-
     if cd_veiculo:
         query = query.filter(OrdemServico.cd_veiculo.ilike(f"%{cd_veiculo}%"))
-
     if try_out:
         query = query.filter(OrdemServico.try_out.ilike(f"%{try_out}%"))
-
     return query
 
 
 def buscar_veiculo_db(db: Session, placa: str):
     placa_limpa = normalizar_placa(placa)
-
     return (
         db.query(VeiculoReferencia)
         .filter(func.replace(func.replace(func.upper(VeiculoReferencia.placa), "-", ""), " ", "") == placa_limpa)
@@ -205,12 +209,57 @@ def buscar_veiculo_db(db: Session, placa: str):
     )
 
 # =========================================================
+# BASE HTML
+# =========================================================
+
+def render_base_html(titulo: str, corpo: str, mensagem: str = ""):
+    return f"""
+    <!DOCTYPE html>
+    <html lang="pt-BR">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>{titulo}</title>
+        <style>
+            body {{ font-family: Arial, sans-serif; background: #f4f6f9; margin: 0; padding: 24px; }}
+            .container {{ max-width: 1500px; margin: 0 auto; }}
+            .card {{ background: white; border-radius: 12px; padding: 20px; box-shadow: 0 2px 12px rgba(0,0,0,0.08); margin-bottom: 20px; }}
+            .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; align-items: end; }}
+            label {{ font-size: 14px; color: #374151; display: block; margin-bottom: 6px; font-weight: bold; }}
+            input {{ width: 100%; padding: 10px; border: 1px solid #d1d5db; border-radius: 8px; box-sizing: border-box; }}
+            button, .btn {{ background: #2563eb; color: white; border: none; padding: 10px 16px; border-radius: 8px; cursor: pointer; text-decoration: none; display: inline-block; font-size: 14px; }}
+            .btn-green {{ background: #059669; }}
+            .btn-danger {{ background: #dc2626; }}
+            .btn-gray {{ background: #374151; }}
+            .btn-orange {{ background: #ea580c; }}
+            .btn-dark {{ background: #111827; }}
+            .btn-purple {{ background: #7c3aed; }}
+            .acoes {{ display: flex; gap: 10px; flex-wrap: wrap; margin: 16px 0; }}
+            table {{ width: 100%; border-collapse: collapse; background: white; }}
+            th, td {{ padding: 12px; text-align: left; border-bottom: 1px solid #e5e7eb; vertical-align: top; font-size: 14px; }}
+            th {{ background: #111827; color: white; }}
+            tr:hover {{ background: #f9fafb; }}
+            .msg {{ background: #ecfdf5; color: #065f46; padding: 12px; border-radius: 8px; margin-bottom: 16px; font-weight: bold; }}
+            .hint {{ color: #6b7280; font-size: 14px; }}
+            @media (max-width: 768px) {{ body {{ padding: 12px; }} th, td {{ font-size: 12px; padding: 8px; }} }}
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>{titulo}</h1>
+            {f'<div class="msg">{mensagem}</div>' if mensagem else ''}
+            {corpo}
+        </div>
+    </body>
+    </html>
+    """
+
+# =========================================================
 # HTML ORDENS
 # =========================================================
 
-def render_html(ordens, filtros):
+def render_ordens_html(ordens, filtros):
     linhas = ""
-
     for item in ordens:
         linhas += f"""
         <tr>
@@ -226,107 +275,50 @@ def render_html(ordens, filtros):
         </tr>
         """
 
-    return f"""
-    <!DOCTYPE html>
-    <html lang="pt-BR">
-    <head>
-        <meta charset="UTF-8" />
-        <title>Painel de Ordens de Serviço</title>
-        <style>
-            body {{ font-family: Arial, sans-serif; background: #f4f6f9; margin: 0; padding: 24px; }}
-            .container {{ max-width: 1600px; margin: 0 auto; }}
-            .card {{ background: white; border-radius: 12px; padding: 20px; box-shadow: 0 2px 12px rgba(0,0,0,0.08); margin-bottom: 20px; }}
-            .filtros {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; align-items: end; }}
-            label {{ font-size: 14px; color: #374151; display: block; margin-bottom: 6px; }}
-            input {{ width: 100%; padding: 10px; border: 1px solid #d1d5db; border-radius: 8px; box-sizing: border-box; }}
-            .acoes {{ display: flex; gap: 10px; flex-wrap: wrap; margin-top: 16px; }}
-            button, .btn {{ background: #2563eb; color: white; border: none; padding: 10px 16px; border-radius: 8px; cursor: pointer; text-decoration: none; display: inline-block; font-size: 14px; }}
-            .btn-secondary {{ background: #059669; }}
-            .btn-json {{ background: #7c3aed; }}
-            .btn-orange {{ background: #ea580c; }}
-            .btn-dark {{ background: #111827; }}
-            table {{ width: 100%; border-collapse: collapse; background: white; }}
-            th, td {{ padding: 12px; text-align: left; border-bottom: 1px solid #e5e7eb; vertical-align: top; font-size: 14px; }}
-            th {{ background: #111827; color: white; }}
-            .topbar {{ display: flex; justify-content: space-between; align-items: center; margin-bottom: 18px; flex-wrap: wrap; gap: 12px; }}
-            .badge {{ background: #e0f2fe; color: #0369a1; padding: 8px 12px; border-radius: 999px; font-size: 14px; font-weight: bold; }}
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <div class="topbar">
-                <h1>Painel de Ordens de Serviço</h1>
-                <div class="badge">Total de registros: {len(ordens)}</div>
-            </div>
-
-            <div class="card">
-                <div class="acoes" style="margin-top:0;">
-                    <a class="btn btn-orange" href="/painel/veiculos">Cadastro de Veículos</a>
-                    <a class="btn btn-dark" href="/painel/usuarios">Cadastro de Usuários</a>
-                </div>
-            </div>
-
-            <div class="card">
-                <form method="get" action="/painel/ordens-servico">
-                    <div class="filtros">
-                        <div>
-                            <label>Usuário</label>
-                            <input type="text" name="usuario" value="{filtros.get("usuario", "")}">
-                        </div>
-                        <div>
-                            <label>Placa</label>
-                            <input type="text" name="placa" value="{filtros.get("placa", "")}">
-                        </div>
-                        <div>
-                            <label>Código do veículo</label>
-                            <input type="text" name="cd_veiculo" value="{filtros.get("cd_veiculo", "")}">
-                        </div>
-                        <div>
-                            <label>Try Out</label>
-                            <input type="text" name="try_out" value="{filtros.get("try_out", "")}">
-                        </div>
-                    </div>
-
-                    <div class="acoes">
-                        <button type="submit">Filtrar</button>
-                        <a class="btn btn-secondary" href="/painel/ordens-servico/exportar/xlsx?usuario={filtros.get("usuario", "")}&placa={filtros.get("placa", "")}&cd_veiculo={filtros.get("cd_veiculo", "")}&try_out={filtros.get("try_out", "")}">Exportar XLSX</a>
-                        <a class="btn btn-json" href="/painel/ordens-servico/exportar/json?usuario={filtros.get("usuario", "")}&placa={filtros.get("placa", "")}&cd_veiculo={filtros.get("cd_veiculo", "")}&try_out={filtros.get("try_out", "")}">Exportar JSON</a>
-                    </div>
-                </form>
-            </div>
-
-            <div class="card" style="padding:0; overflow:auto;">
-                <table>
-                    <thead>
-                        <tr>
-                            <th>ID</th>
-                            <th>Usuário</th>
-                            <th>Placa</th>
-                            <th>CD Veículo</th>
-                            <th>CD Filial</th>
-                            <th>CD Serviço</th>
-                            <th>Try Out</th>
-                            <th>Observação</th>
-                            <th>Criado em</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        {linhas if linhas else '<tr><td colspan="9">Nenhum registro encontrado</td></tr>'}
-                    </tbody>
-                </table>
-            </div>
+    corpo = f"""
+    <div class="card">
+        <div class="acoes" style="margin-top:0;">
+            <a class="btn btn-orange" href="/painel/veiculos">Cadastro de Veiculos</a>
+            <a class="btn btn-dark" href="/painel/usuarios">Cadastro de Usuarios</a>
+            <a class="btn btn-purple" href="/painel/servicos">Cadastro de Servicos</a>
         </div>
-    </body>
-    </html>
+    </div>
+
+    <div class="card">
+        <form method="get" action="/painel/ordens-servico">
+            <div class="grid">
+                <div><label>Usuario</label><input type="text" name="usuario" value="{filtros.get("usuario", "")}"></div>
+                <div><label>Placa</label><input type="text" name="placa" value="{filtros.get("placa", "")}"></div>
+                <div><label>Codigo do veiculo</label><input type="text" name="cd_veiculo" value="{filtros.get("cd_veiculo", "")}"></div>
+                <div><label>Try Out</label><input type="text" name="try_out" value="{filtros.get("try_out", "")}"></div>
+            </div>
+            <div class="acoes">
+                <button type="submit">Filtrar</button>
+                <a class="btn btn-green" href="/painel/ordens-servico/exportar/xlsx?usuario={filtros.get("usuario", "")}&placa={filtros.get("placa", "")}&cd_veiculo={filtros.get("cd_veiculo", "")}&try_out={filtros.get("try_out", "")}">Exportar XLSX</a>
+                <a class="btn btn-purple" href="/painel/ordens-servico/exportar/json?usuario={filtros.get("usuario", "")}&placa={filtros.get("placa", "")}&cd_veiculo={filtros.get("cd_veiculo", "")}&try_out={filtros.get("try_out", "")}">Exportar JSON</a>
+            </div>
+        </form>
+    </div>
+
+    <div class="card" style="padding:0; overflow:auto;">
+        <table>
+            <thead>
+                <tr>
+                    <th>ID</th><th>Usuario</th><th>Placa</th><th>CD Veiculo</th><th>CD Filial</th><th>CD Servico</th><th>Try Out</th><th>Observacao</th><th>Criado em</th>
+                </tr>
+            </thead>
+            <tbody>{linhas if linhas else '<tr><td colspan="9">Nenhum registro encontrado</td></tr>'}</tbody>
+        </table>
+    </div>
     """
+    return render_base_html("Painel de Ordens de Servico", corpo)
 
 # =========================================================
-# HTML VEÍCULOS
+# HTML VEICULOS
 # =========================================================
 
 def render_veiculos_html(veiculos, busca="", mensagem=""):
     linhas = ""
-
     for item in veiculos:
         linhas += f"""
         <tr>
@@ -337,77 +329,69 @@ def render_veiculos_html(veiculos, busca="", mensagem=""):
             <td>{item.cd_ccusto}</td>
             <td>{item.created_at.strftime("%d/%m/%Y %H:%M") if item.created_at else ""}</td>
             <td>
-                <form method="post" action="/painel/veiculos/excluir/{item.id}" onsubmit="return confirm('Excluir este veículo?')">
+                <form method="post" action="/painel/veiculos/excluir/{item.id}" onsubmit="return confirm('Excluir este veiculo?')">
                     <button class="btn-danger" type="submit">Excluir</button>
                 </form>
             </td>
         </tr>
         """
 
-    return render_base_html(
-        titulo="Cadastro de Veículos",
-        mensagem=mensagem,
-        corpo=f"""
-        <div class="acoes">
-            <a class="btn btn-gray" href="/painel/ordens-servico">Voltar para O.S.</a>
-            <a class="btn btn-dark" href="/painel/usuarios">Cadastro de Usuários</a>
-        </div>
+    corpo = f"""
+    <div class="acoes">
+        <a class="btn btn-gray" href="/painel/ordens-servico">Voltar para O.S.</a>
+        <a class="btn btn-dark" href="/painel/usuarios">Cadastro de Usuarios</a>
+        <a class="btn btn-purple" href="/painel/servicos">Cadastro de Servicos</a>
+    </div>
 
-        <div class="card">
-            <h2>Adicionar ou atualizar veículo</h2>
-            <form method="post" action="/painel/veiculos/adicionar">
-                <div class="grid">
-                    <div><label>Placa</label><input name="placa" placeholder="Ex.: SBB2B33" required></div>
-                    <div><label>Código de frota</label><input name="cd_veiculo" placeholder="Ex.: 12040" required></div>
-                    <div><label>Filial da O.S.</label><input name="cd_filial" placeholder="Ex.: 1" required></div>
-                    <div><label>Centro de custo</label><input name="cd_ccusto" placeholder="Ex.: 420119" required></div>
-                </div>
-                <div class="acoes"><button type="submit">Salvar veículo</button></div>
-            </form>
-        </div>
+    <div class="card">
+        <h2>Adicionar ou atualizar veiculo</h2>
+        <form method="post" action="/painel/veiculos/adicionar">
+            <div class="grid">
+                <div><label>Placa</label><input name="placa" placeholder="Ex.: SBB2B33" required></div>
+                <div><label>Codigo de frota</label><input name="cd_veiculo" placeholder="Ex.: 12040" required></div>
+                <div><label>Filial da O.S.</label><input name="cd_filial" placeholder="Ex.: 1" required></div>
+                <div><label>Centro de custo</label><input name="cd_ccusto" placeholder="Ex.: 420119" required></div>
+            </div>
+            <div class="acoes"><button type="submit">Salvar veiculo</button></div>
+        </form>
+    </div>
 
-        <div class="card">
-            <h2>Importar lote via XLSX</h2>
-            <form method="post" action="/painel/veiculos/importar-xlsx" enctype="multipart/form-data">
-                <input type="file" name="arquivo" accept=".xlsx" required>
-                <div class="acoes"><button class="btn-green" type="submit">Importar XLSX</button></div>
-            </form>
-            <p class="hint">Colunas obrigatórias: <b>placa</b>, <b>cd_veiculo</b>, <b>cd_filial</b>, <b>cd_ccusto</b>.</p>
-        </div>
+    <div class="card">
+        <h2>Importar lote via XLSX</h2>
+        <form method="post" action="/painel/veiculos/importar-xlsx" enctype="multipart/form-data">
+            <input type="file" name="arquivo" accept=".xlsx" required>
+            <div class="acoes"><button class="btn-green" type="submit">Importar XLSX</button></div>
+        </form>
+        <p class="hint">Colunas obrigatorias: <b>placa</b>, <b>cd_veiculo</b>, <b>cd_filial</b>, <b>cd_ccusto</b>.</p>
+    </div>
 
-        <div class="card">
-            <h2>Pesquisar</h2>
-            <form method="get" action="/painel/veiculos">
-                <div class="grid">
-                    <div><label>Buscar por placa</label><input name="busca" value="{busca}" placeholder="Digite uma placa"></div>
-                </div>
-                <div class="acoes">
-                    <button type="submit">Buscar</button>
-                    <a class="btn btn-gray" href="/painel/veiculos">Limpar</a>
-                </div>
-            </form>
-        </div>
+    <div class="card">
+        <h2>Pesquisar</h2>
+        <form method="get" action="/painel/veiculos">
+            <div class="grid">
+                <div><label>Buscar por placa</label><input name="busca" value="{busca}" placeholder="Digite uma placa"></div>
+            </div>
+            <div class="acoes"><button type="submit">Buscar</button><a class="btn btn-gray" href="/painel/veiculos">Limpar</a></div>
+        </form>
+    </div>
 
-        <div class="card" style="padding:0; overflow:auto;">
-            <table>
-                <thead>
-                    <tr>
-                        <th>ID</th><th>Placa</th><th>Código Frota</th><th>Filial O.S.</th><th>Centro Custo</th><th>Criado em</th><th>Ação</th>
-                    </tr>
-                </thead>
-                <tbody>{linhas if linhas else '<tr><td colspan="7">Nenhum veículo cadastrado</td></tr>'}</tbody>
-            </table>
-        </div>
-        """,
-    )
+    <div class="card" style="padding:0; overflow:auto;">
+        <table>
+            <thead>
+                <tr><th>ID</th><th>Placa</th><th>Codigo Frota</th><th>Filial O.S.</th><th>Centro Custo</th><th>Criado em</th><th>Acao</th></tr>
+            </thead>
+            <tbody>{linhas if linhas else '<tr><td colspan="7">Nenhum veiculo cadastrado</td></tr>'}</tbody>
+        </table>
+    </div>
+    """
+    return render_base_html("Cadastro de Veiculos", corpo, mensagem)
 
 # =========================================================
-# HTML USUÁRIOS
+# HTML USUARIOS
 # =========================================================
 
 def render_usuarios_html(usuarios, busca="", mensagem=""):
     linhas = ""
-
     for item in usuarios:
         linhas += f"""
         <tr>
@@ -418,121 +402,157 @@ def render_usuarios_html(usuarios, busca="", mensagem=""):
             <td>{item.funcao}</td>
             <td>{item.created_at.strftime("%d/%m/%Y %H:%M") if item.created_at else ""}</td>
             <td>
-                <form method="post" action="/painel/usuarios/excluir/{item.id}" onsubmit="return confirm('Excluir este usuário?')">
+                <form method="post" action="/painel/usuarios/excluir/{item.id}" onsubmit="return confirm('Excluir este usuario?')">
                     <button class="btn-danger" type="submit">Excluir</button>
                 </form>
             </td>
         </tr>
         """
 
-    return render_base_html(
-        titulo="Cadastro de Usuários",
-        mensagem=mensagem,
-        corpo=f"""
-        <div class="acoes">
-            <a class="btn btn-gray" href="/painel/ordens-servico">Voltar para O.S.</a>
-            <a class="btn btn-orange" href="/painel/veiculos">Cadastro de Veículos</a>
-        </div>
+    corpo = f"""
+    <div class="acoes">
+        <a class="btn btn-gray" href="/painel/ordens-servico">Voltar para O.S.</a>
+        <a class="btn btn-orange" href="/painel/veiculos">Cadastro de Veiculos</a>
+        <a class="btn btn-purple" href="/painel/servicos">Cadastro de Servicos</a>
+    </div>
 
-        <div class="card">
-            <h2>Adicionar ou atualizar usuário</h2>
-            <form method="post" action="/painel/usuarios/adicionar">
-                <div class="grid">
-                    <div><label>Matrícula</label><input name="matricula" required></div>
-                    <div><label>Senha</label><input name="senha" required></div>
-                    <div><label>CPF opcional</label><input name="cpf"></div>
-                    <div><label>Nome completo</label><input name="nome_completo" required></div>
-                    <div><label>Função</label><input name="funcao" placeholder="Ex.: Mecânico" required></div>
-                </div>
-                <div class="acoes"><button type="submit">Salvar usuário</button></div>
-            </form>
-        </div>
+    <div class="card">
+        <h2>Adicionar ou atualizar usuario</h2>
+        <form method="post" action="/painel/usuarios/adicionar">
+            <div class="grid">
+                <div><label>Matricula</label><input name="matricula" required></div>
+                <div><label>Senha</label><input name="senha" required></div>
+                <div><label>CPF opcional</label><input name="cpf"></div>
+                <div><label>Nome completo</label><input name="nome_completo" required></div>
+                <div><label>Funcao</label><input name="funcao" placeholder="Ex.: Mecanico" required></div>
+            </div>
+            <div class="acoes"><button type="submit">Salvar usuario</button></div>
+        </form>
+    </div>
 
-        <div class="card">
-            <h2>Importar lote via XLSX</h2>
-            <form method="post" action="/painel/usuarios/importar-xlsx" enctype="multipart/form-data">
-                <input type="file" name="arquivo" accept=".xlsx" required>
-                <div class="acoes"><button class="btn-green" type="submit">Importar XLSX</button></div>
-            </form>
-            <p class="hint">Colunas obrigatórias: <b>matricula</b>, <b>senha</b>, <b>nome_completo</b>, <b>funcao</b>. Coluna opcional: <b>cpf</b>.</p>
-        </div>
+    <div class="card">
+        <h2>Importar lote via XLSX</h2>
+        <form method="post" action="/painel/usuarios/importar-xlsx" enctype="multipart/form-data">
+            <input type="file" name="arquivo" accept=".xlsx" required>
+            <div class="acoes"><button class="btn-green" type="submit">Importar XLSX</button></div>
+        </form>
+        <p class="hint">Colunas obrigatorias: <b>matricula</b>, <b>senha</b>, <b>nome_completo</b>, <b>funcao</b>. Opcional: <b>cpf</b>.</p>
+    </div>
 
-        <div class="card">
-            <h2>Pesquisar</h2>
-            <form method="get" action="/painel/usuarios">
-                <div class="grid">
-                    <div><label>Buscar por matrícula ou nome</label><input name="busca" value="{busca}" placeholder="Digite matrícula ou nome"></div>
-                </div>
-                <div class="acoes">
-                    <button type="submit">Buscar</button>
-                    <a class="btn btn-gray" href="/painel/usuarios">Limpar</a>
-                </div>
-            </form>
-        </div>
+    <div class="card">
+        <h2>Pesquisar</h2>
+        <form method="get" action="/painel/usuarios">
+            <div class="grid">
+                <div><label>Buscar por matricula ou nome</label><input name="busca" value="{busca}" placeholder="Digite matricula ou nome"></div>
+            </div>
+            <div class="acoes"><button type="submit">Buscar</button><a class="btn btn-gray" href="/painel/usuarios">Limpar</a></div>
+        </form>
+    </div>
 
-        <div class="card" style="padding:0; overflow:auto;">
-            <table>
-                <thead>
-                    <tr>
-                        <th>ID</th><th>Matrícula</th><th>Nome completo</th><th>CPF</th><th>Função</th><th>Criado em</th><th>Ação</th>
-                    </tr>
-                </thead>
-                <tbody>{linhas if linhas else '<tr><td colspan="7">Nenhum usuário cadastrado</td></tr>'}</tbody>
-            </table>
-        </div>
-        """,
-    )
-
-
-def render_base_html(titulo: str, corpo: str, mensagem: str = ""):
-    return f"""
-    <!DOCTYPE html>
-    <html lang="pt-BR">
-    <head>
-        <meta charset="UTF-8" />
-        <title>{titulo}</title>
-        <style>
-            body {{ font-family: Arial, sans-serif; background: #f4f6f9; margin: 0; padding: 24px; }}
-            .container {{ max-width: 1400px; margin: 0 auto; }}
-            .card {{ background: white; border-radius: 12px; padding: 20px; box-shadow: 0 2px 12px rgba(0,0,0,0.08); margin-bottom: 20px; }}
-            .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; align-items: end; }}
-            label {{ font-size: 14px; color: #374151; display: block; margin-bottom: 6px; font-weight: bold; }}
-            input {{ width: 100%; padding: 10px; border: 1px solid #d1d5db; border-radius: 8px; box-sizing: border-box; }}
-            button, .btn {{ background: #2563eb; color: white; border: none; padding: 10px 16px; border-radius: 8px; cursor: pointer; text-decoration: none; display: inline-block; font-size: 14px; }}
-            .btn-green {{ background: #059669; }}
-            .btn-danger {{ background: #dc2626; }}
-            .btn-gray {{ background: #374151; }}
-            .btn-orange {{ background: #ea580c; }}
-            .btn-dark {{ background: #111827; }}
-            .acoes {{ display: flex; gap: 10px; flex-wrap: wrap; margin: 16px 0; }}
-            table {{ width: 100%; border-collapse: collapse; background: white; }}
-            th, td {{ padding: 12px; text-align: left; border-bottom: 1px solid #e5e7eb; vertical-align: top; font-size: 14px; }}
-            th {{ background: #111827; color: white; }}
-            .msg {{ background: #ecfdf5; color: #065f46; padding: 12px; border-radius: 8px; margin-bottom: 16px; font-weight: bold; }}
-            .hint {{ color: #6b7280; font-size: 14px; }}
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <h1>{titulo}</h1>
-            {f'<div class="msg">{mensagem}</div>' if mensagem else ''}
-            {corpo}
-        </div>
-    </body>
-    </html>
+    <div class="card" style="padding:0; overflow:auto;">
+        <table>
+            <thead>
+                <tr><th>ID</th><th>Matricula</th><th>Nome completo</th><th>CPF</th><th>Funcao</th><th>Criado em</th><th>Acao</th></tr>
+            </thead>
+            <tbody>{linhas if linhas else '<tr><td colspan="7">Nenhum usuario cadastrado</td></tr>'}</tbody>
+        </table>
+    </div>
     """
+    return render_base_html("Cadastro de Usuarios", corpo, mensagem)
 
 # =========================================================
-# ROTAS BÁSICAS
+# HTML SERVICOS
+# =========================================================
+
+def render_servicos_html(servicos, busca="", mensagem=""):
+    linhas = ""
+    for item in servicos:
+        linhas += f"""
+        <tr>
+            <td>{item.id}</td>
+            <td>{item.cd_grpserv or ""}</td>
+            <td>{item.cd_servico}</td>
+            <td>{item.nm_servico}</td>
+            <td>{item.cd_empresa or ""}</td>
+            <td>{item.bl_inativo or ""}</td>
+            <td>{item.nm_grpserv or ""}</td>
+            <td>{item.nm_empresa or ""}</td>
+            <td>{item.created_at.strftime("%d/%m/%Y %H:%M") if item.created_at else ""}</td>
+            <td>
+                <form method="post" action="/painel/servicos/excluir/{item.id}" onsubmit="return confirm('Excluir este servico?')">
+                    <button class="btn-danger" type="submit">Excluir</button>
+                </form>
+            </td>
+        </tr>
+        """
+
+    corpo = f"""
+    <div class="acoes">
+        <a class="btn btn-gray" href="/painel/ordens-servico">Voltar para O.S.</a>
+        <a class="btn btn-orange" href="/painel/veiculos">Cadastro de Veiculos</a>
+        <a class="btn btn-dark" href="/painel/usuarios">Cadastro de Usuarios</a>
+    </div>
+
+    <div class="card">
+        <h2>Adicionar ou atualizar servico</h2>
+        <form method="post" action="/painel/servicos/adicionar">
+            <div class="grid">
+                <div><label>CD Grupo Servico</label><input name="cd_grpserv" placeholder="Ex.: 1"></div>
+                <div><label>CD Servico</label><input name="cd_servico" placeholder="Ex.: 4194" required></div>
+                <div><label>Nome do servico</label><input name="nm_servico" placeholder="Ex.: TROCAR VALVULA..." required></div>
+                <div><label>CD Empresa</label><input name="cd_empresa" placeholder="Ex.: 1"></div>
+                <div><label>BL Inativo</label><input name="bl_inativo" placeholder="Ex.: 0 ou 1"></div>
+                <div><label>Nome grupo</label><input name="nm_grpserv" placeholder="Ex.: Motor"></div>
+                <div><label>Nome empresa</label><input name="nm_empresa" placeholder="Ex.: Unica"></div>
+            </div>
+            <div class="acoes"><button type="submit">Salvar servico</button></div>
+        </form>
+    </div>
+
+    <div class="card">
+        <h2>Importar lote via XLSX</h2>
+        <form method="post" action="/painel/servicos/importar-xlsx" enctype="multipart/form-data">
+            <input type="file" name="arquivo" accept=".xlsx" required>
+            <div class="acoes"><button class="btn-green" type="submit">Importar XLSX</button></div>
+        </form>
+        <p class="hint">Colunas obrigatorias conforme planilha: <b>cd_grpserv</b>, <b>cd_servico</b>, <b>nm_servico</b>, <b>cd_empresa</b>, <b>bl_inativo</b>, <b>nm_grpserv</b>, <b>nm_empresa</b>.</p>
+    </div>
+
+    <div class="card">
+        <h2>Pesquisar</h2>
+        <form method="get" action="/painel/servicos">
+            <div class="grid">
+                <div><label>Buscar por codigo ou nome</label><input name="busca" value="{busca}" placeholder="Digite codigo ou nome"></div>
+            </div>
+            <div class="acoes"><button type="submit">Buscar</button><a class="btn btn-gray" href="/painel/servicos">Limpar</a></div>
+        </form>
+    </div>
+
+    <div class="card" style="padding:0; overflow:auto;">
+        <table>
+            <thead>
+                <tr>
+                    <th>ID</th><th>CD Grupo</th><th>CD Servico</th><th>Nome Servico</th><th>CD Empresa</th><th>Inativo</th><th>Grupo</th><th>Empresa</th><th>Criado em</th><th>Acao</th>
+                </tr>
+            </thead>
+            <tbody>{linhas if linhas else '<tr><td colspan="10">Nenhum servico cadastrado</td></tr>'}</tbody>
+        </table>
+    </div>
+    """
+    return render_base_html("Cadastro de Servicos", corpo, mensagem)
+
+# =========================================================
+# ROTAS BASICAS
 # =========================================================
 
 @app.get("/")
 def home():
     return {
-        "message": "API de Ordens de Serviço online",
+        "message": "API de Ordens de Servico online",
         "painel_ordens": "/painel/ordens-servico",
         "painel_veiculos": "/painel/veiculos",
         "painel_usuarios": "/painel/usuarios",
+        "painel_servicos": "/painel/servicos",
         "docs": "/docs",
     }
 
@@ -542,7 +562,7 @@ def health():
     return {"status": "ok"}
 
 # =========================================================
-# ROTAS ORDENS DE SERVIÇO
+# ROTAS ORDENS
 # =========================================================
 
 @app.post("/ordens-servico")
@@ -550,7 +570,7 @@ async def criar_ordem_servico(request: Request, db: Session = Depends(get_db)):
     try:
         dados = await request.json()
     except Exception:
-        raise HTTPException(status_code=400, detail="JSON inválido")
+        raise HTTPException(status_code=400, detail="JSON invalido")
 
     payload = montar_payload(dados)
     retorno_integracao = enviar_para_outra_api(payload)
@@ -582,7 +602,7 @@ async def criar_ordem_servico(request: Request, db: Session = Depends(get_db)):
     return {
         "ok": True,
         "id": nova.id,
-        "message": "Ordem de serviço criada com sucesso e enviada para a outra API",
+        "message": "Ordem de servico criada com sucesso e enviada para a outra API",
         "payload_enviado": payload,
         "retorno_integracao": retorno_integracao,
     }
@@ -646,7 +666,7 @@ def painel_ordens_servico(
         "try_out": try_out or "",
     }
 
-    return HTMLResponse(content=render_html(ordens, filtros))
+    return HTMLResponse(content=render_ordens_html(ordens, filtros))
 
 
 @app.get("/painel/ordens-servico/exportar/xlsx")
@@ -665,32 +685,30 @@ def exportar_ordens_xlsx(
     for item in registros:
         dados.append({
             "ID": item.id,
-            "Usuário": item.usuario,
+            "Usuario": item.usuario,
             "Filial Login": item.filial_login,
             "CD Empresa": item.cd_empresa,
-            "CD Veículo": item.cd_veiculo,
+            "CD Veiculo": item.cd_veiculo,
             "Placa": item.placa,
             "DH Entrada": item.dh_entrada,
             "KM Entrada": item.km_entrada,
-            "DH Saída": item.dh_saida,
-            "KM Saída": item.km_saida,
-            "DH Início": item.dh_inicio,
+            "DH Saida": item.dh_saida,
+            "KM Saida": item.km_saida,
+            "DH Inicio": item.dh_inicio,
             "DH Prev": item.dh_prev,
             "CD Filial": item.cd_filial,
             "CD CCusto": item.cd_ccusto,
-            "Observação": item.observacao,
-            "CD Serviço": item.cd_servico,
-            "CD Serviços": item.cd_servicos,
+            "Observacao": item.observacao,
+            "CD Servico": item.cd_servico,
+            "CD Servicos": item.cd_servicos,
             "Try Out": item.try_out,
             "Criado em": item.created_at.strftime("%d/%m/%Y %H:%M") if item.created_at else "",
         })
 
     df = pd.DataFrame(dados)
     output = BytesIO()
-
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name="OrdensServico")
-
     output.seek(0)
 
     return StreamingResponse(
@@ -711,7 +729,6 @@ def exportar_ordens_json(
     query = db.query(OrdemServico)
     query = aplicar_filtros_ordens(query, usuario, placa, cd_veiculo, try_out)
     registros = query.order_by(OrdemServico.created_at.desc()).all()
-
     return JSONResponse(content=[
         {
             "id": item.id,
@@ -739,16 +756,14 @@ def exportar_ordens_json(
     ])
 
 # =========================================================
-# ROTAS VEÍCULOS
+# ROTAS VEICULOS
 # =========================================================
 
 @app.get("/veiculos/placa/{placa}")
 def buscar_veiculo_por_placa(placa: str, db: Session = Depends(get_db)):
     veiculo = buscar_veiculo_db(db, placa)
-
     if not veiculo:
-        raise HTTPException(status_code=404, detail="Veículo não encontrado")
-
+        raise HTTPException(status_code=404, detail="Veiculo nao encontrado")
     return {
         "id": veiculo.id,
         "placa": veiculo.placa,
@@ -761,12 +776,9 @@ def buscar_veiculo_por_placa(placa: str, db: Session = Depends(get_db)):
 @app.get("/veiculos")
 def listar_veiculos(busca: Optional[str] = Query(None), db: Session = Depends(get_db)):
     query = db.query(VeiculoReferencia)
-
     if busca:
         query = query.filter(VeiculoReferencia.placa.ilike(f"%{busca}%"))
-
     veiculos = query.order_by(VeiculoReferencia.placa.asc()).all()
-
     return [
         {
             "id": item.id,
@@ -783,58 +795,45 @@ def listar_veiculos(busca: Optional[str] = Query(None), db: Session = Depends(ge
 @app.get("/painel/veiculos", response_class=HTMLResponse)
 def painel_veiculos(busca: Optional[str] = Query(None), msg: Optional[str] = Query(None), db: Session = Depends(get_db)):
     query = db.query(VeiculoReferencia)
-
     if busca:
         query = query.filter(VeiculoReferencia.placa.ilike(f"%{busca}%"))
-
     veiculos = query.order_by(VeiculoReferencia.placa.asc()).all()
-
     return HTMLResponse(content=render_veiculos_html(veiculos, busca or "", msg or ""))
 
 
 @app.post("/painel/veiculos/adicionar")
 async def adicionar_veiculo(request: Request, db: Session = Depends(get_db)):
     form = await request.form()
-
     placa = to_str(form.get("placa")).upper()
     cd_veiculo = to_str(form.get("cd_veiculo"))
     cd_filial = to_str(form.get("cd_filial"))
     cd_ccusto = to_str(form.get("cd_ccusto"))
 
     if not placa or not cd_veiculo or not cd_filial or not cd_ccusto:
-        raise HTTPException(status_code=400, detail="Todos os campos são obrigatórios")
+        raise HTTPException(status_code=400, detail="Todos os campos sao obrigatorios")
 
     existente = buscar_veiculo_db(db, placa)
-
     if existente:
         existente.placa = placa
         existente.cd_veiculo = cd_veiculo
         existente.cd_filial = cd_filial
         existente.cd_ccusto = cd_ccusto
-        mensagem = "Veículo atualizado com sucesso"
+        mensagem = "Veiculo atualizado com sucesso"
     else:
-        db.add(VeiculoReferencia(
-            placa=placa,
-            cd_veiculo=cd_veiculo,
-            cd_filial=cd_filial,
-            cd_ccusto=cd_ccusto,
-        ))
-        mensagem = "Veículo cadastrado com sucesso"
+        db.add(VeiculoReferencia(placa=placa, cd_veiculo=cd_veiculo, cd_filial=cd_filial, cd_ccusto=cd_ccusto))
+        mensagem = "Veiculo cadastrado com sucesso"
 
     db.commit()
-
     return RedirectResponse(url=f"/painel/veiculos?msg={mensagem}", status_code=303)
 
 
 @app.post("/painel/veiculos/excluir/{veiculo_id}")
 def excluir_veiculo(veiculo_id: int, db: Session = Depends(get_db)):
     veiculo = db.query(VeiculoReferencia).filter(VeiculoReferencia.id == veiculo_id).first()
-
     if veiculo:
         db.delete(veiculo)
         db.commit()
-
-    return RedirectResponse(url="/painel/veiculos?msg=Veículo excluído com sucesso", status_code=303)
+    return RedirectResponse(url="/painel/veiculos?msg=Veiculo excluido com sucesso", status_code=303)
 
 
 @app.post("/painel/veiculos/importar-xlsx")
@@ -842,24 +841,17 @@ async def importar_veiculos_xlsx(arquivo: UploadFile = File(...), db: Session = 
     if not arquivo.filename.lower().endswith(".xlsx"):
         raise HTTPException(status_code=400, detail="Envie um arquivo .xlsx")
 
-    conteudo = await arquivo.read()
-
     try:
-        df = pd.read_excel(BytesIO(conteudo))
+        df = pd.read_excel(BytesIO(await arquivo.read()))
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Erro ao ler XLSX: {str(e)}")
 
     df.columns = [str(c).strip().lower() for c in df.columns]
-
     colunas_obrigatorias = {"placa", "cd_veiculo", "cd_filial", "cd_ccusto"}
-
     if not colunas_obrigatorias.issubset(set(df.columns)):
         raise HTTPException(status_code=400, detail="O XLSX precisa ter as colunas: placa, cd_veiculo, cd_filial, cd_ccusto")
 
-    total_processado = 0
-    total_criado = 0
-    total_atualizado = 0
-
+    total_processado = total_criado = total_atualizado = 0
     for _, row in df.iterrows():
         placa = to_str(row.get("placa")).upper()
         cd_veiculo = to_str(row.get("cd_veiculo"))
@@ -870,7 +862,6 @@ async def importar_veiculos_xlsx(arquivo: UploadFile = File(...), db: Session = 
             continue
 
         existente = buscar_veiculo_db(db, placa)
-
         if existente:
             existente.placa = placa
             existente.cd_veiculo = cd_veiculo
@@ -878,24 +869,16 @@ async def importar_veiculos_xlsx(arquivo: UploadFile = File(...), db: Session = 
             existente.cd_ccusto = cd_ccusto
             total_atualizado += 1
         else:
-            db.add(VeiculoReferencia(
-                placa=placa,
-                cd_veiculo=cd_veiculo,
-                cd_filial=cd_filial,
-                cd_ccusto=cd_ccusto,
-            ))
+            db.add(VeiculoReferencia(placa=placa, cd_veiculo=cd_veiculo, cd_filial=cd_filial, cd_ccusto=cd_ccusto))
             total_criado += 1
-
         total_processado += 1
 
     db.commit()
-
-    msg = f"Importação concluída: {total_processado} processados, {total_criado} criados, {total_atualizado} atualizados"
-
+    msg = f"Importacao concluida: {total_processado} processados, {total_criado} criados, {total_atualizado} atualizados"
     return RedirectResponse(url=f"/painel/veiculos?msg={msg}", status_code=303)
 
 # =========================================================
-# ROTAS USUÁRIOS
+# ROTAS USUARIOS
 # =========================================================
 
 @app.post("/usuarios/login")
@@ -903,20 +886,14 @@ async def login_usuario_app(request: Request, db: Session = Depends(get_db)):
     try:
         dados = await request.json()
     except Exception:
-        raise HTTPException(status_code=400, detail="JSON inválido")
+        raise HTTPException(status_code=400, detail="JSON invalido")
 
     matricula = to_str(dados.get("matricula"))
     senha = to_str(dados.get("senha"))
 
-    usuario = (
-        db.query(UsuarioApp)
-        .filter(UsuarioApp.matricula == matricula)
-        .filter(UsuarioApp.senha == senha)
-        .first()
-    )
-
+    usuario = db.query(UsuarioApp).filter(UsuarioApp.matricula == matricula).filter(UsuarioApp.senha == senha).first()
     if not usuario:
-        raise HTTPException(status_code=401, detail="Matrícula ou senha inválida")
+        raise HTTPException(status_code=401, detail="Matricula ou senha invalida")
 
     return {
         "ok": True,
@@ -933,15 +910,9 @@ async def login_usuario_app(request: Request, db: Session = Depends(get_db)):
 @app.get("/usuarios")
 def listar_usuarios(busca: Optional[str] = Query(None), db: Session = Depends(get_db)):
     query = db.query(UsuarioApp)
-
     if busca:
-        query = query.filter(
-            (UsuarioApp.matricula.ilike(f"%{busca}%")) |
-            (UsuarioApp.nome_completo.ilike(f"%{busca}%"))
-        )
-
+        query = query.filter(or_(UsuarioApp.matricula.ilike(f"%{busca}%"), UsuarioApp.nome_completo.ilike(f"%{busca}%")))
     usuarios = query.order_by(UsuarioApp.nome_completo.asc()).all()
-
     return [
         {
             "id": item.id,
@@ -958,22 +929,15 @@ def listar_usuarios(busca: Optional[str] = Query(None), db: Session = Depends(ge
 @app.get("/painel/usuarios", response_class=HTMLResponse)
 def painel_usuarios(busca: Optional[str] = Query(None), msg: Optional[str] = Query(None), db: Session = Depends(get_db)):
     query = db.query(UsuarioApp)
-
     if busca:
-        query = query.filter(
-            (UsuarioApp.matricula.ilike(f"%{busca}%")) |
-            (UsuarioApp.nome_completo.ilike(f"%{busca}%"))
-        )
-
+        query = query.filter(or_(UsuarioApp.matricula.ilike(f"%{busca}%"), UsuarioApp.nome_completo.ilike(f"%{busca}%")))
     usuarios = query.order_by(UsuarioApp.nome_completo.asc()).all()
-
     return HTMLResponse(content=render_usuarios_html(usuarios, busca or "", msg or ""))
 
 
 @app.post("/painel/usuarios/adicionar")
 async def adicionar_usuario(request: Request, db: Session = Depends(get_db)):
     form = await request.form()
-
     matricula = to_str(form.get("matricula"))
     senha = to_str(form.get("senha"))
     cpf = to_str(form.get("cpf"))
@@ -981,40 +945,30 @@ async def adicionar_usuario(request: Request, db: Session = Depends(get_db)):
     funcao_usuario = to_str(form.get("funcao"))
 
     if not matricula or not senha or not nome_completo or not funcao_usuario:
-        raise HTTPException(status_code=400, detail="Matrícula, senha, nome completo e função são obrigatórios")
+        raise HTTPException(status_code=400, detail="Matricula, senha, nome completo e funcao sao obrigatorios")
 
     existente = db.query(UsuarioApp).filter(UsuarioApp.matricula == matricula).first()
-
     if existente:
         existente.senha = senha
         existente.cpf = cpf
         existente.nome_completo = nome_completo
         existente.funcao = funcao_usuario
-        mensagem = "Usuário atualizado com sucesso"
+        mensagem = "Usuario atualizado com sucesso"
     else:
-        db.add(UsuarioApp(
-            matricula=matricula,
-            senha=senha,
-            cpf=cpf,
-            nome_completo=nome_completo,
-            funcao=funcao_usuario,
-        ))
-        mensagem = "Usuário cadastrado com sucesso"
+        db.add(UsuarioApp(matricula=matricula, senha=senha, cpf=cpf, nome_completo=nome_completo, funcao=funcao_usuario))
+        mensagem = "Usuario cadastrado com sucesso"
 
     db.commit()
-
     return RedirectResponse(url=f"/painel/usuarios?msg={mensagem}", status_code=303)
 
 
 @app.post("/painel/usuarios/excluir/{usuario_id}")
 def excluir_usuario(usuario_id: int, db: Session = Depends(get_db)):
     usuario = db.query(UsuarioApp).filter(UsuarioApp.id == usuario_id).first()
-
     if usuario:
         db.delete(usuario)
         db.commit()
-
-    return RedirectResponse(url="/painel/usuarios?msg=Usuário excluído com sucesso", status_code=303)
+    return RedirectResponse(url="/painel/usuarios?msg=Usuario excluido com sucesso", status_code=303)
 
 
 @app.post("/painel/usuarios/importar-xlsx")
@@ -1022,24 +976,17 @@ async def importar_usuarios_xlsx(arquivo: UploadFile = File(...), db: Session = 
     if not arquivo.filename.lower().endswith(".xlsx"):
         raise HTTPException(status_code=400, detail="Envie um arquivo .xlsx")
 
-    conteudo = await arquivo.read()
-
     try:
-        df = pd.read_excel(BytesIO(conteudo))
+        df = pd.read_excel(BytesIO(await arquivo.read()))
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Erro ao ler XLSX: {str(e)}")
 
     df.columns = [str(c).strip().lower() for c in df.columns]
-
     colunas_obrigatorias = {"matricula", "senha", "nome_completo", "funcao"}
-
     if not colunas_obrigatorias.issubset(set(df.columns)):
-        raise HTTPException(status_code=400, detail="O XLSX precisa ter as colunas: matricula, senha, nome_completo, funcao. A coluna cpf é opcional.")
+        raise HTTPException(status_code=400, detail="O XLSX precisa ter as colunas: matricula, senha, nome_completo, funcao. A coluna cpf e opcional.")
 
-    total_processado = 0
-    total_criado = 0
-    total_atualizado = 0
-
+    total_processado = total_criado = total_atualizado = 0
     for _, row in df.iterrows():
         matricula = to_str(row.get("matricula"))
         senha = to_str(row.get("senha"))
@@ -1051,7 +998,6 @@ async def importar_usuarios_xlsx(arquivo: UploadFile = File(...), db: Session = 
             continue
 
         existente = db.query(UsuarioApp).filter(UsuarioApp.matricula == matricula).first()
-
         if existente:
             existente.senha = senha
             existente.cpf = cpf
@@ -1059,19 +1005,168 @@ async def importar_usuarios_xlsx(arquivo: UploadFile = File(...), db: Session = 
             existente.funcao = funcao_usuario
             total_atualizado += 1
         else:
-            db.add(UsuarioApp(
-                matricula=matricula,
-                senha=senha,
-                cpf=cpf,
-                nome_completo=nome_completo,
-                funcao=funcao_usuario,
+            db.add(UsuarioApp(matricula=matricula, senha=senha, cpf=cpf, nome_completo=nome_completo, funcao=funcao_usuario))
+            total_criado += 1
+        total_processado += 1
+
+    db.commit()
+    msg = f"Importacao concluida: {total_processado} processados, {total_criado} criados, {total_atualizado} atualizados"
+    return RedirectResponse(url=f"/painel/usuarios?msg={msg}", status_code=303)
+
+# =========================================================
+# ROTAS SERVICOS
+# =========================================================
+
+@app.get("/servicos")
+def listar_servicos(busca: Optional[str] = Query(None), db: Session = Depends(get_db)):
+    query = db.query(ServicoReferencia)
+
+    # Por padrao, nao retorna inativos quando bl_inativo = 1
+    query = query.filter(or_(ServicoReferencia.bl_inativo.is_(None), ServicoReferencia.bl_inativo != "1"))
+
+    if busca:
+        busca_like = f"%{busca}%"
+        query = query.filter(or_(
+            ServicoReferencia.cd_servico.ilike(busca_like),
+            ServicoReferencia.nm_servico.ilike(busca_like),
+            ServicoReferencia.nm_grpserv.ilike(busca_like),
+        ))
+
+    servicos = query.order_by(ServicoReferencia.nm_servico.asc()).all()
+    return [
+        {
+            "id": item.id,
+            "cd_grpserv": item.cd_grpserv,
+            "cd_servico": item.cd_servico,
+            "nm_servico": item.nm_servico,
+            "nome_servico": item.nm_servico,  # compatibilidade com Flutter anterior
+            "cd_empresa": item.cd_empresa,
+            "bl_inativo": item.bl_inativo,
+            "nm_grpserv": item.nm_grpserv,
+            "nm_empresa": item.nm_empresa,
+            "created_at": item.created_at.isoformat() if item.created_at else None,
+        }
+        for item in servicos
+    ]
+
+
+@app.get("/painel/servicos", response_class=HTMLResponse)
+def painel_servicos(busca: Optional[str] = Query(None), msg: Optional[str] = Query(None), db: Session = Depends(get_db)):
+    query = db.query(ServicoReferencia)
+    if busca:
+        busca_like = f"%{busca}%"
+        query = query.filter(or_(
+            ServicoReferencia.cd_servico.ilike(busca_like),
+            ServicoReferencia.nm_servico.ilike(busca_like),
+            ServicoReferencia.nm_grpserv.ilike(busca_like),
+        ))
+    servicos = query.order_by(ServicoReferencia.nm_servico.asc()).all()
+    return HTMLResponse(content=render_servicos_html(servicos, busca or "", msg or ""))
+
+
+@app.post("/painel/servicos/adicionar")
+async def adicionar_servico(request: Request, db: Session = Depends(get_db)):
+    form = await request.form()
+    cd_grpserv = to_str(form.get("cd_grpserv"))
+    cd_servico = to_str(form.get("cd_servico"))
+    nm_servico = to_str(form.get("nm_servico"))
+    cd_empresa = to_str(form.get("cd_empresa"))
+    bl_inativo = to_str(form.get("bl_inativo"))
+    nm_grpserv = to_str(form.get("nm_grpserv"))
+    nm_empresa = to_str(form.get("nm_empresa"))
+
+    if not cd_servico or not nm_servico:
+        raise HTTPException(status_code=400, detail="cd_servico e nm_servico sao obrigatorios")
+
+    existente = db.query(ServicoReferencia).filter(ServicoReferencia.cd_servico == cd_servico).first()
+    if existente:
+        existente.cd_grpserv = cd_grpserv
+        existente.nm_servico = nm_servico
+        existente.cd_empresa = cd_empresa
+        existente.bl_inativo = bl_inativo
+        existente.nm_grpserv = nm_grpserv
+        existente.nm_empresa = nm_empresa
+        mensagem = "Servico atualizado com sucesso"
+    else:
+        db.add(ServicoReferencia(
+            cd_grpserv=cd_grpserv,
+            cd_servico=cd_servico,
+            nm_servico=nm_servico,
+            cd_empresa=cd_empresa,
+            bl_inativo=bl_inativo,
+            nm_grpserv=nm_grpserv,
+            nm_empresa=nm_empresa,
+        ))
+        mensagem = "Servico cadastrado com sucesso"
+
+    db.commit()
+    return RedirectResponse(url=f"/painel/servicos?msg={mensagem}", status_code=303)
+
+
+@app.post("/painel/servicos/excluir/{servico_id}")
+def excluir_servico(servico_id: int, db: Session = Depends(get_db)):
+    servico = db.query(ServicoReferencia).filter(ServicoReferencia.id == servico_id).first()
+    if servico:
+        db.delete(servico)
+        db.commit()
+    return RedirectResponse(url="/painel/servicos?msg=Servico excluido com sucesso", status_code=303)
+
+
+@app.post("/painel/servicos/importar-xlsx")
+async def importar_servicos_xlsx(arquivo: UploadFile = File(...), db: Session = Depends(get_db)):
+    if not arquivo.filename.lower().endswith(".xlsx"):
+        raise HTTPException(status_code=400, detail="Envie um arquivo .xlsx")
+
+    try:
+        df = pd.read_excel(BytesIO(await arquivo.read()))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Erro ao ler XLSX: {str(e)}")
+
+    df.columns = [str(c).strip().lower() for c in df.columns]
+    colunas_obrigatorias = {"cd_grpserv", "cd_servico", "nm_servico", "cd_empresa", "bl_inativo", "nm_grpserv", "nm_empresa"}
+    if not colunas_obrigatorias.issubset(set(df.columns)):
+        raise HTTPException(
+            status_code=400,
+            detail="O XLSX precisa ter as colunas: cd_grpserv, cd_servico, nm_servico, cd_empresa, bl_inativo, nm_grpserv, nm_empresa",
+        )
+
+    total_processado = total_criado = total_atualizado = 0
+
+    for _, row in df.iterrows():
+        cd_grpserv = to_str(row.get("cd_grpserv"))
+        cd_servico = to_str(row.get("cd_servico"))
+        nm_servico = to_str(row.get("nm_servico"))
+        cd_empresa = to_str(row.get("cd_empresa"))
+        bl_inativo = to_str(row.get("bl_inativo"))
+        nm_grpserv = to_str(row.get("nm_grpserv"))
+        nm_empresa = to_str(row.get("nm_empresa"))
+
+        if not cd_servico or not nm_servico:
+            continue
+
+        existente = db.query(ServicoReferencia).filter(ServicoReferencia.cd_servico == cd_servico).first()
+        if existente:
+            existente.cd_grpserv = cd_grpserv
+            existente.nm_servico = nm_servico
+            existente.cd_empresa = cd_empresa
+            existente.bl_inativo = bl_inativo
+            existente.nm_grpserv = nm_grpserv
+            existente.nm_empresa = nm_empresa
+            total_atualizado += 1
+        else:
+            db.add(ServicoReferencia(
+                cd_grpserv=cd_grpserv,
+                cd_servico=cd_servico,
+                nm_servico=nm_servico,
+                cd_empresa=cd_empresa,
+                bl_inativo=bl_inativo,
+                nm_grpserv=nm_grpserv,
+                nm_empresa=nm_empresa,
             ))
             total_criado += 1
 
         total_processado += 1
 
     db.commit()
-
-    msg = f"Importação concluída: {total_processado} processados, {total_criado} criados, {total_atualizado} atualizados"
-
-    return RedirectResponse(url=f"/painel/usuarios?msg={msg}", status_code=303)
+    msg = f"Importacao concluida: {total_processado} processados, {total_criado} criados, {total_atualizado} atualizados"
+    return RedirectResponse(url=f"/painel/servicos?msg={msg}", status_code=303)
