@@ -608,6 +608,23 @@ def status_class(status: str) -> str:
     return "status-pendente"
 
 
+def mascarar_senha(valor: Any) -> Any:
+    """
+    Remove/mascara senha antes de gravar logs e retornos.
+    """
+    if isinstance(valor, dict):
+        novo = {}
+        for chave, item in valor.items():
+            if str(chave).lower() == "senha":
+                novo[chave] = "***"
+            else:
+                novo[chave] = mascarar_senha(item)
+        return novo
+    if isinstance(valor, list):
+        return [mascarar_senha(item) for item in valor]
+    return valor
+
+
 def escape_html(valor: Any) -> str:
     if valor is None:
         return ""
