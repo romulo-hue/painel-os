@@ -608,6 +608,19 @@ def status_class(status: str) -> str:
     return "status-pendente"
 
 
+def escape_html(valor: Any) -> str:
+    if valor is None:
+        return ""
+    return (
+        str(valor)
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+        .replace("'", "&#039;")
+    )
+
+
 def json_dumps_safe(value: Any) -> str:
     try:
         return json.dumps(value, ensure_ascii=False)
