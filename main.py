@@ -12,7 +12,7 @@ from fastapi import Depends, FastAPI, HTTPException, File, UploadFile, Form, Req
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
-from sqlalchemy import Column, ForeignKey, Integer, String, Text, text
+from sqlalchemy import Column, ForeignKey, Integer, String, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, relationship
 from starlette.middleware.sessions import SessionMiddleware
@@ -96,12 +96,6 @@ class OrdemServicoModel(Base):
     observacoes = Column(String, nullable=True)
     data_cadastro = Column(String, nullable=True, index=True)
     foto = Column(String, nullable=True)
-
-    # Novos campos do app Android
-    # fotos_app guarda uma lista JSON com todas as fotos recebidas do app.
-    # app_payload guarda o JSON completo recebido, permitindo editar todos os campos enviados pelo app.
-    fotos_app = Column(Text, nullable=True)
-    app_payload = Column(Text, nullable=True)
 
     itens = relationship(
         "OrdemServicoItemModel",
@@ -487,8 +481,6 @@ def startup():
         conn.execute(text("ALTER TABLE ordens_servico ADD COLUMN IF NOT EXISTS observacoes VARCHAR"))
         conn.execute(text("ALTER TABLE ordens_servico ADD COLUMN IF NOT EXISTS data_cadastro VARCHAR"))
         conn.execute(text("ALTER TABLE ordens_servico ADD COLUMN IF NOT EXISTS foto VARCHAR"))
-        conn.execute(text("ALTER TABLE ordens_servico ADD COLUMN IF NOT EXISTS fotos_app TEXT"))
-        conn.execute(text("ALTER TABLE ordens_servico ADD COLUMN IF NOT EXISTS app_payload TEXT"))
 
         conn.execute(text("UPDATE ordens_servico SET matricula = '' WHERE matricula IS NULL"))
         conn.execute(text("UPDATE ordens_servico SET mecanico = '' WHERE mecanico IS NULL"))
@@ -1656,8 +1648,6 @@ def listar_ordens_servico(
                 "hora_fim": row.hora_fim, "servico": row.servico,
                 "observacoes": row.observacoes, "data_cadastro": row.data_cadastro,
                 "foto_url": row.foto,
-                "fotos": _fotos_ordem(db.query(OrdemServicoModel).filter(OrdemServicoModel.id == row.id).first()) if db.query(OrdemServicoModel).filter(OrdemServicoModel.id == row.id).first() else [],
-                "app_payload": _payload_ordem(db.query(OrdemServicoModel).filter(OrdemServicoModel.id == row.id).first()) if db.query(OrdemServicoModel).filter(OrdemServicoModel.id == row.id).first() else {},
             }
             for row in rows
         ]
@@ -1734,183 +1724,34 @@ def _hora_painel(value: str) -> str:
     return "00:00"
 
 
-def _salvar_fotos_app(payload: Dict[str, Any]) -> List[str]:
-    """
-    Salva todas as fotos enviadas pelo app.
-
-    O app envia normalmente:
-    photos: [
-      {
-        "filename": "foto-os-1.jpg",
-        "content_type": "image/jpeg",
-        "data_base64": "..."
-      }
-    ]
-    """
+def _salvar_primeira_foto_app(payload: Dict[str, Any]) -> Optional[str]:
     photos = payload.get("photos") or payload.get("fotos") or []
     if not isinstance(photos, list) or not photos:
-        return []
+        return None
 
-    caminhos = []
-    for index, item in enumerate(photos, start=1):
-        if not isinstance(item, dict):
-            continue
+    first = photos[0]
+    if not isinstance(first, dict):
+        return None
 
-        data_base64 = item.get("data_base64") or item.get("base64") or item.get("data")
-        if not data_base64:
-            continue
+    data_base64 = first.get("data_base64") or first.get("base64") or first.get("data")
+    if not data_base64:
+        return None
 
-        try:
-            raw = base64.b64decode(str(data_base64), validate=False)
-        except Exception:
-            continue
-
-        filename = str(item.get("filename") or item.get("nome") or f"foto-os-{index}.jpg")
-        ext = os.path.splitext(filename)[-1].lower()
-        if ext not in (".jpg", ".jpeg", ".png"):
-            ext = ".jpg"
-
-        nome_arquivo = f"app_{int(datetime.now().timestamp() * 1000)}_{index}{ext}"
-        destino = os.path.join(UPLOAD_DIR, nome_arquivo)
-        with open(destino, "wb") as f:
-            f.write(raw)
-
-        caminhos.append(f"/fotos/{nome_arquivo}")
-
-    return caminhos
-
-
-def _salvar_primeira_foto_app(payload: Dict[str, Any]) -> Optional[str]:
-    """
-    Mantida por compatibilidade. Retorna a primeira foto salva.
-    """
-    caminhos = _salvar_fotos_app(payload)
-    return caminhos[0] if caminhos else None
-
-
-def _json_dumps_safe(valor: Any) -> str:
     try:
-        return json.dumps(valor, ensure_ascii=False)
-    except Exception:
-        return str(valor)
-
-
-def _json_loads_safe(valor: str) -> Any:
-    try:
-        return json.loads(valor or "null")
+        raw = base64.b64decode(str(data_base64), validate=False)
     except Exception:
         return None
 
+    filename = str(first.get("filename") or first.get("nome") or "foto-os.jpg")
+    ext = os.path.splitext(filename)[-1].lower()
+    if ext not in (".jpg", ".jpeg", ".png"):
+        ext = ".jpg"
 
-def _fotos_ordem(ordem: OrdemServicoModel) -> List[str]:
-    fotos = _json_loads_safe(ordem.fotos_app or "")
-    if isinstance(fotos, list):
-        return [str(f) for f in fotos if str(f).strip()]
-    if ordem.foto:
-        return [ordem.foto]
-    return []
-
-
-def _payload_ordem(ordem: OrdemServicoModel) -> Dict[str, Any]:
-    payload = _json_loads_safe(ordem.app_payload or "")
-    return payload if isinstance(payload, dict) else {}
-
-
-def _payload_editavel_html(ordem: OrdemServicoModel) -> str:
-    """
-    Monta formulário de edição dos principais campos enviados pelo app.
-    Se o app_payload tiver campos extras, eles também aparecem no final.
-    """
-    payload = _payload_ordem(ordem)
-
-    campos = [
-        ("plate", "Placa"),
-        ("vehicle_code", "Código do veículo / frota"),
-        ("defect_description", "Descrição do defeito"),
-        ("opening_datetime", "Data/hora abertura"),
-        ("entry_hourmeter", "Horímetro entrada"),
-        ("odometer", "Hodômetro entrada"),
-        ("exit_datetime", "Data/hora saída"),
-        ("exit_hourmeter", "Horímetro saída"),
-        ("exit_odometer", "Hodômetro saída"),
-        ("start_datetime", "Data/hora início"),
-        ("expected_release_datetime", "Previsão liberação"),
-        ("expected_hours", "Horas previstas"),
-        ("actual_hours", "Horas realizadas"),
-        ("branch_code", "Código filial"),
-        ("department_code", "Código departamento"),
-        ("observations", "Observações"),
-        ("service_code", "Código serviço"),
-        ("component_code", "Código componente"),
-        ("driver_code", "Código motorista"),
-        ("occurrence_number", "Número ocorrência"),
-        ("return_order_number", "Número O.S. retorno"),
-    ]
-
-    aliases = {
-        "plate": ["placa"],
-        "vehicle_code": ["codigo_veiculo", "cd_veiculo"],
-        "defect_description": ["descricao_defeito"],
-        "opening_datetime": ["data_hora_abertura"],
-        "entry_hourmeter": ["horimetro_entrada"],
-        "odometer": ["hodometro", "km"],
-        "exit_datetime": ["data_hora_saida"],
-        "exit_hourmeter": ["horimetro_saida"],
-        "exit_odometer": ["hodometro_saida"],
-        "start_datetime": ["data_hora_inicio"],
-        "expected_release_datetime": ["data_hora_previsao_liberacao"],
-        "expected_hours": ["horas_previstas"],
-        "actual_hours": ["horas_realizadas"],
-        "branch_code": ["codigo_filial"],
-        "department_code": ["codigo_departamento"],
-        "observations": ["observacoes"],
-        "service_code": ["codigo_servico"],
-        "component_code": ["codigo_componente"],
-        "driver_code": ["codigo_motorista"],
-        "occurrence_number": ["numero_ocorrencia"],
-        "return_order_number": ["numero_os_retorno"],
-    }
-
-    def valor_do_payload(chave: str) -> str:
-        if chave in payload:
-            return str(payload.get(chave) or "")
-        for alias in aliases.get(chave, []):
-            if alias in payload:
-                return str(payload.get(alias) or "")
-        if chave == "plate":
-            return ordem.placa or ""
-        if chave == "odometer":
-            return ordem.km or ""
-        if chave == "opening_datetime":
-            return ordem.data_cadastro or ""
-        if chave == "observations":
-            return ordem.observacoes or ""
-        return ""
-
-    html = ""
-    for chave, label in campos:
-        valor = escape_html(valor_do_payload(chave))
-        html += f"""
-          <label>{escape_html(label)}
-            <input type="text" name="{escape_html(chave)}" value="{valor}">
-          </label>
-        """
-
-    # Campos extras que não estão na lista principal
-    principais = {c[0] for c in campos}
-    alias_flat = {a for lista in aliases.values() for a in lista}
-    for chave, valor in payload.items():
-        if chave in principais or chave in alias_flat or chave in ("photos", "fotos", "credenciais", "campos_brutos"):
-            continue
-        if isinstance(valor, (dict, list)):
-            valor = _json_dumps_safe(valor)
-        html += f"""
-          <label>{escape_html(chave)}
-            <input type="text" name="extra__{escape_html(chave)}" value="{escape_html(valor)}">
-          </label>
-        """
-
-    return html
+    nome_arquivo = f"app_{int(datetime.now().timestamp() * 1000)}{ext}"
+    destino = os.path.join(UPLOAD_DIR, nome_arquivo)
+    with open(destino, "wb") as f:
+        f.write(raw)
+    return f"/fotos/{nome_arquivo}"
 
 
 @app.post("/panel/os")
@@ -1970,8 +1811,7 @@ async def receber_os_app_no_painel(payload: Dict[str, Any], db: Session = Depend
     if detalhes:
         observacao_final = (observacao_final + " | " if observacao_final else "") + " | ".join(detalhes)
 
-    fotos_paths = _salvar_fotos_app(payload)
-    foto_path = fotos_paths[0] if fotos_paths else None
+    foto_path = _salvar_primeira_foto_app(payload)
 
     nova_ordem = OrdemServicoModel(
         placa=placa.strip().upper(),
@@ -1983,8 +1823,6 @@ async def receber_os_app_no_painel(payload: Dict[str, Any], db: Session = Depend
         observacoes=observacao_final,
         data_cadastro=_normalizar_data_painel(abertura),
         foto=foto_path,
-        fotos_app=_json_dumps_safe(fotos_paths),
-        app_payload=_json_dumps_safe(payload),
     )
 
     db.add(nova_ordem)
@@ -2046,141 +1884,6 @@ async def receber_servico_app_no_painel(payload: Dict[str, Any], db: Session = D
         "message": f"Servico salvo no painel na O.S. {ordem.id}. Nao foi enviado ao FrotaWeb.",
     }
 
-
-
-# =========================
-# EDIÇÃO DE O.S. DO APP NO PAINEL
-# =========================
-
-@app.get("/painel/ordens-servico/{ordem_id}/editar", response_class=HTMLResponse)
-def editar_ordem_servico_painel(request: Request, ordem_id: int, db: Session = Depends(get_db)):
-    if not usuario_logado(request):
-        return RedirectResponse(url="/login", status_code=303)
-
-    ordem = db.query(OrdemServicoModel).filter(OrdemServicoModel.id == ordem_id).first()
-    if ordem is None:
-        raise HTTPException(status_code=404, detail="O.S. não encontrada")
-
-    fotos_html = ""
-    for foto in _fotos_ordem(ordem):
-        fotos_html += f"""
-          <a href="{escape_html(foto)}" target="_blank">
-            <img src="{escape_html(foto)}" style="height:90px;border-radius:8px;margin:4px;border:1px solid #ddd;">
-          </a>
-        """
-
-    html = f"""
-    <html>
-      <head>
-        <meta charset="UTF-8">
-        <title>Editar O.S. {ordem.id}</title>
-        <style>
-          body {{ font-family: Arial, sans-serif; margin:20px; background:#f7f7f7; }}
-          .card {{ background:white; padding:18px; border-radius:12px; box-shadow:0 2px 10px rgba(0,0,0,.08); margin-bottom:18px; }}
-          .grid {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(240px,1fr)); gap:12px; }}
-          label {{ display:flex; flex-direction:column; gap:6px; font-weight:bold; color:#374151; }}
-          input, textarea {{ padding:10px; border:1px solid #ccc; border-radius:8px; font-size:14px; }}
-          textarea {{ min-height:120px; }}
-          .btn {{ padding:10px 16px; border:0; border-radius:8px; cursor:pointer; text-decoration:none; display:inline-block; }}
-          .btn-salvar {{ background:#0f766e; color:white; }}
-          .btn-voltar {{ background:#e5e7eb; color:#111827; }}
-          .btn-excluir {{ background:#dc2626; color:white; }}
-          .acoes {{ display:flex; gap:10px; flex-wrap:wrap; margin-top:16px; }}
-        </style>
-      </head>
-      <body>
-        <h1>Editar O.S. {ordem.id}</h1>
-
-        <div class="card">
-          <h2>Fotos recebidas do app</h2>
-          {fotos_html if fotos_html else '<p>Nenhuma foto recebida.</p>'}
-        </div>
-
-        <form method="post" action="/painel/ordens-servico/{ordem.id}/editar">
-          <div class="card">
-            <h2>Campos principais do painel</h2>
-            <div class="grid">
-              <label>Placa<input type="text" name="painel_placa" value="{escape_html(ordem.placa)}"></label>
-              <label>Matrícula<input type="text" name="painel_matricula" value="{escape_html(ordem.matricula)}"></label>
-              <label>Mecânico<input type="text" name="painel_mecanico" value="{escape_html(ordem.mecanico)}"></label>
-              <label>KM<input type="text" name="painel_km" value="{escape_html(ordem.km)}"></label>
-              <label>Hora início<input type="text" name="painel_hora_inicio" value="{escape_html(ordem.hora_inicio)}"></label>
-              <label>Hora fim<input type="text" name="painel_hora_fim" value="{escape_html(ordem.hora_fim)}"></label>
-              <label>Data cadastro<input type="text" name="painel_data_cadastro" value="{escape_html(ordem.data_cadastro)}"></label>
-            </div>
-            <label style="margin-top:12px;">Observações / descrição da O.S.
-              <textarea name="painel_observacoes">{escape_html(ordem.observacoes)}</textarea>
-            </label>
-          </div>
-
-          <div class="card">
-            <h2>Campos recebidos do aplicativo</h2>
-            <p>Edite aqui todos os campos que vieram do app. Eles ficarão salvos no JSON da O.S.</p>
-            <div class="grid">
-              {_payload_editavel_html(ordem)}
-            </div>
-          </div>
-
-          <div class="acoes">
-            <button type="submit" class="btn btn-salvar">Salvar alterações</button>
-            <a href="/painel/ordens-servico" class="btn btn-voltar">Voltar</a>
-          </div>
-        </form>
-
-        <div class="card">
-          <form method="post" action="/ordens-servico/{ordem.id}/excluir"
-                onsubmit="return confirm('Deseja excluir definitivamente a O.S. {ordem.id}?');">
-            <button type="submit" class="btn btn-excluir">Deletar O.S.</button>
-          </form>
-        </div>
-      </body>
-    </html>
-    """
-    return html
-
-
-@app.post("/painel/ordens-servico/{ordem_id}/editar")
-async def salvar_edicao_ordem_servico_painel(request: Request, ordem_id: int, db: Session = Depends(get_db)):
-    if not usuario_logado(request):
-        return RedirectResponse(url="/login", status_code=303)
-
-    ordem = db.query(OrdemServicoModel).filter(OrdemServicoModel.id == ordem_id).first()
-    if ordem is None:
-        raise HTTPException(status_code=404, detail="O.S. não encontrada")
-
-    form = await request.form()
-    payload = _payload_ordem(ordem)
-
-    # Campos principais do painel
-    ordem.placa = str(form.get("painel_placa") or "").strip().upper()
-    ordem.matricula = str(form.get("painel_matricula") or "").strip()
-    ordem.mecanico = str(form.get("painel_mecanico") or "").strip()
-    ordem.km = str(form.get("painel_km") or "").strip()
-    ordem.hora_inicio = str(form.get("painel_hora_inicio") or "").strip()
-    ordem.hora_fim = str(form.get("painel_hora_fim") or "").strip()
-    ordem.data_cadastro = str(form.get("painel_data_cadastro") or "").strip()
-    ordem.observacoes = str(form.get("painel_observacoes") or "").strip()
-
-    # Campos do app
-    for chave, valor in form.items():
-        chave = str(chave)
-        if chave.startswith("painel_"):
-            continue
-        if chave.startswith("extra__"):
-            payload[chave.replace("extra__", "", 1)] = str(valor).strip()
-        else:
-            payload[chave] = str(valor).strip()
-
-    # Mantém o payload coerente com os campos principais
-    payload["plate"] = ordem.placa
-    payload["odometer"] = ordem.km
-    payload["opening_datetime"] = ordem.data_cadastro
-    payload["observations"] = ordem.observacoes
-
-    ordem.app_payload = _json_dumps_safe(payload)
-    db.commit()
-
-    return RedirectResponse(url=f"/painel/ordens-servico/{ordem.id}/editar", status_code=303)
 
 # =========================
 # DASHBOARD JSON
@@ -2626,41 +2329,19 @@ def painel_dashboard(
 @app.get("/painel/ordens-servico", response_class=HTMLResponse)
 def painel_ordens_servico(
     request: Request,
-    id_filtro: str = "",
     placa: str = "",
     matricula: str = "",
     mecanico: str = "",
     km: str = "",
-    hora_inicio: str = "",
-    hora_fim: str = "",
     servico: str = "",
-    observacoes: str = "",
     data_cadastro: str = "",
-    foto: str = "",
     db: Session = Depends(get_db),
 ):
     if not usuario_logado(request):
         return RedirectResponse(url="/login", status_code=303)
 
     rows = buscar_linhas_ordens(db, placa=placa, matricula=matricula, mecanico=mecanico, km=km, servico=servico, data_cadastro=data_cadastro)
-
-    def contem(valor, filtro):
-        return not str(filtro or "").strip() or str(filtro or "").strip().lower() in str(valor or "").lower()
-
-    rows = [
-        row for row in rows
-        if contem(row.id, id_filtro)
-        and contem(row.hora_inicio, hora_inicio)
-        and contem(row.hora_fim, hora_fim)
-        and contem(row.observacoes, observacoes)
-        and contem(row.foto, foto)
-    ]
-
-    filtro_query = (
-        f"id_filtro={id_filtro}&placa={placa}&matricula={matricula}&mecanico={mecanico}"
-        f"&km={km}&hora_inicio={hora_inicio}&hora_fim={hora_fim}&servico={servico}"
-        f"&observacoes={observacoes}&data_cadastro={data_cadastro}&foto={foto}"
-    )
+    filtro_query = f"placa={placa}&matricula={matricula}&mecanico={mecanico}&km={km}&servico={servico}&data_cadastro={data_cadastro}"
 
     html = f"""
     <html>
@@ -2702,17 +2383,12 @@ def painel_ordens_servico(
           </div>
           <form method="get" action="/painel/ordens-servico">
             <div class="filtros">
-              <input type="text" name="id_filtro" placeholder="Filtrar por ID" value="{escape_html(id_filtro)}">
               <input type="text" name="placa" placeholder="Filtrar por placa" value="{escape_html(placa)}">
               <input type="text" name="matricula" placeholder="Filtrar por matrícula" value="{escape_html(matricula)}">
               <input type="text" name="mecanico" placeholder="Filtrar por mecânico" value="{escape_html(mecanico)}">
               <input type="text" name="km" placeholder="Filtrar por KM" value="{escape_html(km)}">
-              <input type="text" name="hora_inicio" placeholder="Filtrar por hora início" value="{escape_html(hora_inicio)}">
-              <input type="text" name="hora_fim" placeholder="Filtrar por hora fim" value="{escape_html(hora_fim)}">
               <input type="text" name="servico" placeholder="Filtrar por serviço" value="{escape_html(servico)}">
-              <input type="text" name="observacoes" placeholder="Filtrar por observações" value="{escape_html(observacoes)}">
               <input type="text" name="data_cadastro" placeholder="Filtrar por data" value="{escape_html(data_cadastro)}">
-              <input type="text" name="foto" placeholder="Filtrar por foto" value="{escape_html(foto)}">
             </div>
             <div class="acoes">
               <button type="submit" class="btn btn-buscar">Buscar</button>
@@ -2729,7 +2405,7 @@ def painel_ordens_servico(
               <tr>
                 <th>ID</th><th>Placa</th><th>Matrícula</th><th>Mecânico</th><th>KM</th>
                 <th>Hora início</th><th>Hora fim</th><th>Serviço / Produtos</th>
-                <th>Fotos</th><th>Observações</th><th>Data cadastro</th><th>Ações</th>
+                <th>Foto</th><th>Observações</th><th>Data cadastro</th><th>Ações</th>
               </tr>
             </thead>
             <tbody>
@@ -2758,30 +2434,21 @@ def painel_ordens_servico(
 
             foto_html = ""
             if primeira_linha_da_ordem:
-                fotos = _fotos_ordem(ordem) if ordem else ([row.foto] if row.foto else [])
-                if fotos:
-                    thumbs = []
-                    for idx_foto, caminho_foto in enumerate(fotos, start=1):
-                        thumbs.append(
-                            f"<a href='{escape_html(caminho_foto)}' target='_blank' title='Foto {idx_foto}'>"
-                            f"<img src='{escape_html(caminho_foto)}' class='foto-thumb' alt='foto {idx_foto}'>"
-                            f"</a>"
-                        )
-                    foto_html = "<div style='display:flex;gap:6px;flex-wrap:wrap;'>" + "".join(thumbs) + "</div>"
+                if row.foto:
+                    foto_html = (
+                        f"<a href='{escape_html(row.foto)}' target='_blank'>"
+                        f"<img src='{escape_html(row.foto)}' class='foto-thumb' alt='foto'>"
+                        f"</a>"
+                    )
                 else:
                     foto_html = "<span style='color:#9ca3af;font-size:12px;'>Sem foto</span>"
 
             botao_excluir = ""
             if primeira_linha_da_ordem:
-                botao_editar = f"""
-                <a href="/painel/ordens-servico/{row.id}/editar" class="btn btn-exportar">Editar</a>
-                """
-
                 botao_excluir = f"""
-                {botao_editar}
                 <form class="inline" method="post" action="/ordens-servico/{row.id}/excluir"
                       onsubmit="return confirm('Deseja excluir a O.S. {row.id}?');">
-                  <button type="submit" class="btn btn-excluir">Deletar</button>
+                  <button type="submit" class="btn btn-excluir">Excluir</button>
                 </form>
                 """
                 ids_exibidos.add(row.id)
