@@ -1,4 +1,5 @@
 import os
+import json
 from typing import Any, Generator, Optional
 
 import requests
@@ -469,6 +470,124 @@ def post_json(url: str, payload: dict) -> dict:
     return retorno
 
 
+
+
+def extrair_numero_os(retorno):
+    """
+    Tenta encontrar o numero da O.S. no retorno da API FrotaWeb.
+    Aceita retornos com chaves diferentes, pois cada integracao pode nomear o campo de um jeito.
+    """
+    candidatos = {
+        "numero_os", "nr_os", "num_os", "os", "codigo_os", "cod_os",
+        "order_number", "ordem_servico", "ordem", "id_os", "id"
+    }
+
+    def walk(obj):
+        if isinstance(obj, dict):
+            # Primeiro procura chaves mais provaveis.
+            for chave, valor in obj.items():
+                if str(chave).lower() in candidatos and valor not in (None, "", 0):
+                    texto = str(valor).strip()
+                    if texto and texto.lower() not in ("true", "false", "none", "null"):
+                        return texto
+            # Depois procura em estruturas aninhadas.
+            for valor in obj.values():
+                encontrado = walk(valor)
+                if encontrado:
+                    return encontrado
+        elif isinstance(obj, list):
+            for item in obj:
+                encontrado = walk(item)
+                if encontrado:
+                    return encontrado
+        return ""
+
+    return walk(retorno)
+
+
+def contar_servicos_da_os(db: Session, ordem: OrdemServico):
+    numeros = {str(ordem.id)}
+    if ordem.numero_os:
+        numeros.add(str(ordem.numero_os))
+
+    query = db.query(ServicoOS).filter(ServicoOS.deleted_at.is_(None))
+    todos = query.all()
+
+    relacionados = []
+    for serv in todos:
+        mesmo_numero = str(serv.numero_os or "") in numeros
+        mesmo_veiculo = (
+            ordem.codigo_veiculo
+            and serv.codigo_veiculo
+            and str(serv.codigo_veiculo).strip() == str(ordem.codigo_veiculo).strip()
+        )
+        mesma_placa = (
+            ordem.placa
+            and serv.placa
+            and str(serv.placa).strip().upper() == str(ordem.placa).strip().upper()
+        )
+        if mesmo_numero or (mesmo_veiculo and mesma_placa):
+            relacionados.append(serv)
+
+    total = len(relacionados)
+    enviados = len([s for s in relacionados if s.status_envio == "ENVIADA"])
+    erros = len([s for s in relacionados if str(s.status_envio or "").startswith("ERRO")])
+    pendentes = total - enviados - erros
+    return total, enviados, erros, pendentes, relacionados
+
+
+def enviar_servicos_relacionados(db: Session, ordem: OrdemServico, numero_os_frotaweb: str):
+    """
+    Depois que a O.S. e enviada com sucesso, tenta enviar automaticamente os servicos vinculados.
+    Se algum servico falhar, a O.S. continua ENVIADA, mas o retorno mostra quantos servicos falharam.
+    """
+    total, enviados_antes, erros_antes, pendentes_antes, relacionados = contar_servicos_da_os(db, ordem)
+
+    enviados_agora = 0
+    erros_agora = 0
+    detalhes = []
+
+    for serv in relacionados:
+        if serv.status_envio == "ENVIADA":
+            continue
+
+        if numero_os_frotaweb:
+            serv.numero_os = numero_os_frotaweb
+
+        if not serv.codigo_veiculo:
+            serv.codigo_veiculo = ordem.codigo_veiculo
+        if not serv.placa:
+            serv.placa = ordem.placa
+
+        payload_serv = payload_servico_from_model(serv)
+
+        try:
+            retorno_serv = post_json(FROTAWEB_SERVICO_URL, payload_serv)
+            serv.status_envio = "ENVIADA"
+            serv.retorno_envio = str(retorno_serv)
+            enviados_agora += 1
+            detalhes.append(f"servico_id={serv.id}: ENVIADO")
+        except HTTPException as exc:
+            serv.status_envio = "ERRO_ENVIO"
+            serv.retorno_envio = str(exc.detail)
+            erros_agora += 1
+            detalhes.append(f"servico_id={serv.id}: ERRO")
+
+    db.commit()
+
+    total_final, enviados_final, erros_final, pendentes_final, _ = contar_servicos_da_os(db, ordem)
+
+    return {
+        "total": total_final,
+        "enviados": enviados_final,
+        "erros": erros_final,
+        "pendentes": pendentes_final,
+        "enviados_agora": enviados_agora,
+        "erros_agora": erros_agora,
+        "detalhes": detalhes,
+    }
+
+
 def status_class(status: str) -> str:
     if status == "ENVIADA":
         return "status-enviada"
@@ -524,19 +643,33 @@ def render_painel(ordens, servicos, filtro_status: str = "", msg: str = "") -> s
     for o in ordens:
         st = o.status_envio or "PENDENTE"
         ret = (o.retorno_envio or "")
-        if len(ret) > 200:
-            ret = ret[:200] + "..."
+        if len(ret) > 220:
+            ret = ret[:220] + "..."
+
+        serv_rel = [s for s in servicos if str(s.numero_os or "") in (str(o.id), str(o.numero_os or ""))]
+        total_serv = len(serv_rel)
+        enviados_serv = len([s for s in serv_rel if s.status_envio == "ENVIADA"])
+        erros_serv = len([s for s in serv_rel if str(s.status_envio or "").startswith("ERRO")])
+        pend_serv = max(total_serv - enviados_serv - erros_serv, 0)
+
+        servico_resumo = f"{enviados_serv}/{total_serv} enviados"
+        if erros_serv:
+            servico_resumo += f" | {erros_serv} erro(s)"
+        if pend_serv:
+            servico_resumo += f" | {pend_serv} pendente(s)"
+
         if st == "ENVIADA":
-            acao = "<span class='status-enviada'>Enviada</span>"
+            acao = "<span class='status-enviada'>O.S. enviada</span>"
         else:
             acao = f"""
             <form method="post" action="/painel/ordens-servico/enviar/{o.id}" onsubmit="return confirm('Enviar O.S. {o.id} ao FrotaWeb?')">
-              <button class="btn-green" type="submit">Enviar O.S.</button>
+              <button class="btn-green" type="submit">Enviar O.S. + Serviços</button>
             </form>
             """
         linhas_os += f"""
         <tr>
-          <td>{o.id}</td><td><span class="{status_class(st)}">{st}</span></td><td>{o.codigo_veiculo or ""}</td><td>{o.placa or ""}</td>
+          <td>{o.id}</td><td><span class="{status_class(st)}">{st}</span></td><td>{o.numero_os or ""}</td><td>{servico_resumo}</td>
+          <td>{o.codigo_veiculo or ""}</td><td>{o.placa or ""}</td>
           <td>{o.hodometro or ""}</td><td>{o.data_hora_abertura or ""}</td><td>{o.data_hora_saida or ""}</td>
           <td>{o.codigo_filial or ""}</td><td>{o.codigo_departamento or ""}</td><td>{o.descricao_defeito or ""}</td>
           <td class="retorno">{ret}</td><td>{o.created_at.strftime("%d/%m/%Y %H:%M") if o.created_at else ""}</td><td>{acao}</td>
@@ -584,8 +717,8 @@ def render_painel(ordens, servicos, filtro_status: str = "", msg: str = "") -> s
     </div>
     <div class="card" style="padding:0; overflow:auto;">
       <h2 style="padding:18px; margin:0;">Ordens de Serviço</h2>
-      <table><thead><tr><th>ID</th><th>Status</th><th>Veículo</th><th>Placa</th><th>KM</th><th>Abertura</th><th>Saída</th><th>Filial</th><th>Departamento</th><th>Defeito</th><th>Retorno</th><th>Criado em</th><th>Ação</th></tr></thead>
-      <tbody>{linhas_os if linhas_os else '<tr><td colspan="13">Nenhuma O.S. encontrada</td></tr>'}</tbody></table>
+      <table><thead><tr><th>ID Painel</th><th>Status</th><th>Nº O.S. FrotaWeb</th><th>Serviços</th><th>Veículo</th><th>Placa</th><th>KM</th><th>Abertura</th><th>Saída</th><th>Filial</th><th>Departamento</th><th>Defeito</th><th>Retorno</th><th>Criado em</th><th>Ação</th></tr></thead>
+      <tbody>{linhas_os if linhas_os else '<tr><td colspan="15">Nenhuma O.S. encontrada</td></tr>'}</tbody></table>
     </div>
     <div class="card" style="padding:0; overflow:auto;">
       <h2 style="padding:18px; margin:0;">Serviços da O.S.</h2>
@@ -594,6 +727,7 @@ def render_painel(ordens, servicos, filtro_status: str = "", msg: str = "") -> s
     </div>
     """
     return html_base("Painel O.S. Corretiva", corpo, msg)
+
 
 # =========================================================
 # ROTAS
@@ -699,7 +833,9 @@ def enviar_os(ordem_id: int, db: Session = Depends(get_db)):
     ordem = db.query(OrdemServico).filter(OrdemServico.id == ordem_id).filter(OrdemServico.deleted_at.is_(None)).first()
     if not ordem:
         raise HTTPException(status_code=404, detail="O.S. nao encontrada")
+
     payload = payload_os_from_ordem(ordem)
+
     try:
         retorno = post_json(FROTAWEB_OS_URL, payload)
     except HTTPException as exc:
@@ -707,10 +843,32 @@ def enviar_os(ordem_id: int, db: Session = Depends(get_db)):
         ordem.retorno_envio = str(exc.detail)
         db.commit()
         return RedirectResponse(url=f"/painel/ordens-servico?msg=Erro ao enviar O.S. {ordem.id}", status_code=303)
+
+    numero_os_frotaweb = extrair_numero_os(retorno)
+    if numero_os_frotaweb:
+        ordem.numero_os = numero_os_frotaweb
+
+    resumo_servicos = enviar_servicos_relacionados(db, ordem, numero_os_frotaweb or str(ordem.numero_os or ordem.id))
+
     ordem.status_envio = "ENVIADA"
-    ordem.retorno_envio = str(retorno)
+    ordem.retorno_envio = (
+        f"O.S. enviada com sucesso. "
+        f"Nº O.S. FrotaWeb: {numero_os_frotaweb or ordem.numero_os or 'não identificado'}. "
+        f"Serviços: {resumo_servicos['enviados']}/{resumo_servicos['total']} enviados, "
+        f"{resumo_servicos['erros']} erro(s), {resumo_servicos['pendentes']} pendente(s). "
+        f"Retorno O.S.: {retorno}"
+    )
     db.commit()
-    return RedirectResponse(url=f"/painel/ordens-servico?msg=O.S. {ordem.id} enviada com sucesso", status_code=303)
+
+    msg = (
+        f"O.S. {ordem.id} enviada com sucesso. "
+        f"Nº FrotaWeb: {numero_os_frotaweb or ordem.numero_os or 'não identificado'}. "
+        f"Serviços: {resumo_servicos['enviados']}/{resumo_servicos['total']} enviados."
+    )
+    if resumo_servicos["erros"]:
+        msg += f" {resumo_servicos['erros']} serviço(s) com erro."
+
+    return RedirectResponse(url=f"/painel/ordens-servico?msg={msg}", status_code=303)
 
 
 @app.post("/painel/servicos-os/enviar/{servico_id}")
@@ -739,10 +897,28 @@ def enviar_os_json(ordem_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="O.S. nao encontrada")
     payload = payload_os_from_ordem(ordem)
     retorno = post_json(FROTAWEB_OS_URL, payload)
+
+    numero_os_frotaweb = extrair_numero_os(retorno)
+    if numero_os_frotaweb:
+        ordem.numero_os = numero_os_frotaweb
+
+    resumo_servicos = enviar_servicos_relacionados(db, ordem, numero_os_frotaweb or str(ordem.numero_os or ordem.id))
+
     ordem.status_envio = "ENVIADA"
-    ordem.retorno_envio = str(retorno)
+    ordem.retorno_envio = (
+        f"O.S. enviada com sucesso. Nº O.S. FrotaWeb: {numero_os_frotaweb or ordem.numero_os or 'não identificado'}. "
+        f"Serviços: {resumo_servicos['enviados']}/{resumo_servicos['total']} enviados, "
+        f"{resumo_servicos['erros']} erro(s), {resumo_servicos['pendentes']} pendente(s). "
+        f"Retorno O.S.: {retorno}"
+    )
     db.commit()
-    return {"ok": True, "payload_enviado": payload, "retorno": retorno}
+    return {
+        "ok": True,
+        "numero_os_frotaweb": numero_os_frotaweb or ordem.numero_os,
+        "servicos": resumo_servicos,
+        "payload_enviado": payload,
+        "retorno": retorno
+    }
 
 
 @app.post("/ordens-servico/servicos/{servico_id}/enviar-frotaweb")
