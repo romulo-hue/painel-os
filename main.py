@@ -1,12 +1,10 @@
 import os
-from io import BytesIO
-from typing import Optional
+from typing import Generator, Optional, Any
 
-import pandas as pd
 import requests
-from fastapi import FastAPI, Depends, Query, Request, HTTPException, UploadFile, File
-from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse, RedirectResponse
-from sqlalchemy import create_engine, Column, Integer, String, DateTime, Text, func, or_, text
+from fastapi import FastAPI, Depends, Request, HTTPException, Query
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from sqlalchemy import create_engine, Column, Integer, String, DateTime, Text, func, text
 from sqlalchemy.orm import sessionmaker, declarative_base, Session
 
 # =========================================================
@@ -17,8 +15,8 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL nao configurada no ambiente")
 
-INTEGRACAO_OUTRA_API_URL = os.getenv(
-    "INTEGRACAO_OUTRA_API_URL",
+INTEGRACAO_FROTAWEB_URL = os.getenv(
+    "INTEGRACAO_FROTAWEB_URL",
     "https://integracao-frotaweb.onrender.com/frotaweb/os-corretiva",
 )
 
@@ -26,30 +24,36 @@ engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
-app = FastAPI(title="Painel de Ordens de Servico")
+app = FastAPI(
+    title="Painel O.S. Corretiva",
+    version="1.0.0",
+    description="Painel simples para receber O.S. do app, conferir e enviar manualmente ao FrotaWeb.",
+)
 
 # =========================================================
 # DATABASE
 # =========================================================
 
-def get_db():
+def get_db() -> Generator[Session, None, None]:
     db = SessionLocal()
     try:
         yield db
     finally:
         db.close()
 
-# =========================================================
-# MODELS
-# =========================================================
 
 class OrdemServico(Base):
     __tablename__ = "ordens_servico"
 
     id = Column(Integer, primary_key=True, index=True)
+
+    # Login/credenciais usadas no envio manual ao FrotaWeb
     usuario = Column(String(255), nullable=True)
+    senha_frotaweb = Column(String(255), nullable=True)
     filial_login = Column(String(255), nullable=True)
     cd_empresa = Column(String(100), nullable=True)
+
+    # Dados da O.S.
     cd_veiculo = Column(String(100), nullable=True)
     placa = Column(String(50), nullable=True)
     dh_entrada = Column(String(100), nullable=True)
@@ -64,142 +68,124 @@ class OrdemServico(Base):
     cd_servico = Column(String(100), nullable=True)
     cd_servicos = Column(Text, nullable=True)
     try_out = Column(String(255), nullable=True)
+
+    # Controle do painel
     status_envio = Column(String(50), nullable=False, default="PENDENTE")
     retorno_envio = Column(Text, nullable=True)
-    senha_frotaweb = Column(String(255), nullable=True)
+    payload_original = Column(Text, nullable=True)
+
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
     deleted_at = Column(DateTime(timezone=True), nullable=True)
 
 
-class VeiculoReferencia(Base):
-    __tablename__ = "veiculos_referencia"
-
-    id = Column(Integer, primary_key=True, index=True)
-    placa = Column(String(20), nullable=False, unique=True, index=True)
-    cd_veiculo = Column(String(100), nullable=False)
-    cd_filial = Column(String(100), nullable=False)
-    cd_ccusto = Column(String(100), nullable=False)
-    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
-
-
-class UsuarioApp(Base):
-    __tablename__ = "usuarios_app"
-
-    id = Column(Integer, primary_key=True, index=True)
-    matricula = Column(String(50), nullable=False, unique=True, index=True)
-    senha = Column(String(255), nullable=False)
-    cpf = Column(String(20), nullable=True)
-    nome_completo = Column(String(255), nullable=False)
-    funcao = Column(String(100), nullable=False)
-    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
-
-
-class ServicoReferencia(Base):
-    __tablename__ = "servicos_referencia"
-
-    id = Column(Integer, primary_key=True, index=True)
-    cd_grpserv = Column(String(100), nullable=True)
-    cd_servico = Column(String(100), nullable=False, unique=True, index=True)
-    nm_servico = Column(String(255), nullable=False, index=True)
-    cd_empresa = Column(String(100), nullable=True)
-    bl_inativo = Column(String(20), nullable=True)
-    nm_grpserv = Column(String(255), nullable=True)
-    nm_empresa = Column(String(255), nullable=True)
-    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
-
-# =========================================================
-# INIT DB
-# =========================================================
-
 Base.metadata.create_all(bind=engine)
 
-def garantir_colunas_envio():
-    """Garante colunas novas em bancos ja existentes no Render."""
+
+def garantir_colunas():
+    """Garante colunas em bancos ja existentes no Render."""
     with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE ordens_servico ADD COLUMN IF NOT EXISTS usuario VARCHAR(255)"))
+        conn.execute(text("ALTER TABLE ordens_servico ADD COLUMN IF NOT EXISTS senha_frotaweb VARCHAR(255)"))
+        conn.execute(text("ALTER TABLE ordens_servico ADD COLUMN IF NOT EXISTS filial_login VARCHAR(255)"))
+        conn.execute(text("ALTER TABLE ordens_servico ADD COLUMN IF NOT EXISTS cd_empresa VARCHAR(100)"))
+        conn.execute(text("ALTER TABLE ordens_servico ADD COLUMN IF NOT EXISTS cd_veiculo VARCHAR(100)"))
+        conn.execute(text("ALTER TABLE ordens_servico ADD COLUMN IF NOT EXISTS placa VARCHAR(50)"))
+        conn.execute(text("ALTER TABLE ordens_servico ADD COLUMN IF NOT EXISTS dh_entrada VARCHAR(100)"))
+        conn.execute(text("ALTER TABLE ordens_servico ADD COLUMN IF NOT EXISTS km_entrada VARCHAR(100)"))
+        conn.execute(text("ALTER TABLE ordens_servico ADD COLUMN IF NOT EXISTS dh_saida VARCHAR(100)"))
+        conn.execute(text("ALTER TABLE ordens_servico ADD COLUMN IF NOT EXISTS km_saida VARCHAR(100)"))
+        conn.execute(text("ALTER TABLE ordens_servico ADD COLUMN IF NOT EXISTS dh_inicio VARCHAR(100)"))
+        conn.execute(text("ALTER TABLE ordens_servico ADD COLUMN IF NOT EXISTS dh_prev VARCHAR(100)"))
+        conn.execute(text("ALTER TABLE ordens_servico ADD COLUMN IF NOT EXISTS cd_filial VARCHAR(100)"))
+        conn.execute(text("ALTER TABLE ordens_servico ADD COLUMN IF NOT EXISTS cd_ccusto VARCHAR(100)"))
+        conn.execute(text("ALTER TABLE ordens_servico ADD COLUMN IF NOT EXISTS observacao TEXT"))
+        conn.execute(text("ALTER TABLE ordens_servico ADD COLUMN IF NOT EXISTS cd_servico VARCHAR(100)"))
+        conn.execute(text("ALTER TABLE ordens_servico ADD COLUMN IF NOT EXISTS cd_servicos TEXT"))
+        conn.execute(text("ALTER TABLE ordens_servico ADD COLUMN IF NOT EXISTS try_out VARCHAR(255)"))
         conn.execute(text("ALTER TABLE ordens_servico ADD COLUMN IF NOT EXISTS status_envio VARCHAR(50) DEFAULT 'PENDENTE'"))
         conn.execute(text("ALTER TABLE ordens_servico ADD COLUMN IF NOT EXISTS retorno_envio TEXT"))
-        conn.execute(text("ALTER TABLE ordens_servico ADD COLUMN IF NOT EXISTS senha_frotaweb VARCHAR(255)"))
+        conn.execute(text("ALTER TABLE ordens_servico ADD COLUMN IF NOT EXISTS payload_original TEXT"))
+        conn.execute(text("ALTER TABLE ordens_servico ADD COLUMN IF NOT EXISTS created_at TIMESTAMP WITH TIME ZONE DEFAULT now()"))
+        conn.execute(text("ALTER TABLE ordens_servico ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP WITH TIME ZONE DEFAULT now()"))
+        conn.execute(text("ALTER TABLE ordens_servico ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMP WITH TIME ZONE"))
         conn.execute(text("UPDATE ordens_servico SET status_envio = 'PENDENTE' WHERE status_envio IS NULL"))
 
-garantir_colunas_envio()
 
+garantir_colunas()
 
 # =========================================================
 # HELPERS
 # =========================================================
 
-def to_str(value, default=""):
+def to_str(value: Any, default: str = "") -> str:
     if value is None:
         return default
-    text = str(value).strip()
-    if text.lower() == "nan":
+    text_value = str(value).strip()
+    if text_value.lower() == "nan":
         return default
-    return text
+    return text_value
 
 
-def normalizar_placa(placa: str) -> str:
-    return to_str(placa).upper().replace("-", "").replace(" ", "")
-
-
-def normalize_cd_servicos(value):
-    if isinstance(value, list):
-        return [to_str(v) for v in value if to_str(v)]
+def normalizar_lista(value: Any) -> list[str]:
     if value is None:
         return []
-    valor = to_str(value)
-    return [valor] if valor else []
+    if isinstance(value, list):
+        return [to_str(v) for v in value if to_str(v)]
+    text_value = to_str(value)
+    if not text_value:
+        return []
+    if "," in text_value:
+        return [item.strip() for item in text_value.split(",") if item.strip()]
+    return [text_value]
 
 
+def pick_value(dados: dict, *nomes: str, default: str = "") -> str:
+    for nome in nomes:
+        if "." in nome:
+            grupo, chave = nome.split(".", 1)
+            origem = dados.get(grupo) or {}
+            valor = origem.get(chave) if isinstance(origem, dict) else None
+        else:
+            valor = dados.get(nome)
+        text_value = to_str(valor)
+        if text_value:
+            return text_value
+    return default
 
-def montar_payload(dados: dict) -> dict:
+
+def montar_payload_painel(dados: dict) -> dict:
     """
-    Aceita tanto o JSON do painel quanto o JSON vindo do app Android.
-    O app antigo envia campos como vehicle_code, plate, opening_datetime, odometer.
-    A integracao FrotaWeb espera campos como cd_veiculo, placa, dh_entrada, km_entrada.
+    Aceita:
+    - JSON do app Android: vehicle_code, plate, opening_datetime, odometer...
+    - JSON ja mapeado do painel: cd_veiculo, placa, dh_entrada...
+    - credenciais em credenciais.* ou credentials.*
     """
-    credenciais = dados.get("credenciais") or dados.get("credentials") or {}
-    if not isinstance(credenciais, dict):
-        credenciais = {}
 
-    def pick(*nomes, default=""):
-        for nome in nomes:
-            if "." in nome:
-                grupo, chave = nome.split(".", 1)
-                origem = dados.get(grupo) or {}
-                if isinstance(origem, dict):
-                    valor = origem.get(chave)
-                else:
-                    valor = None
-            else:
-                valor = dados.get(nome)
-            texto = to_str(valor)
-            if texto:
-                return texto
-        return default
+    usuario = pick_value(dados, "usuario", "credenciais.usuario", "credentials.usuario")
+    senha = pick_value(dados, "senha", "credenciais.senha", "credentials.senha")
+    filial_login = pick_value(dados, "filial_login", "credenciais.filial", "credentials.filial", "branch_code")
+    cd_empresa = pick_value(dados, "cd_empresa", "empresa", "credenciais.empresa", "credentials.empresa", default="1")
 
-    usuario = pick("usuario", "credenciais.usuario", "credentials.usuario")
-    senha = pick("senha", "credenciais.senha", "credentials.senha")
-    filial_login = pick("filial_login", "credenciais.filial", "credentials.filial", "branch_code")
-    cd_empresa = pick("cd_empresa", "empresa", "credenciais.empresa", "credentials.empresa", default="1")
+    cd_veiculo = pick_value(dados, "cd_veiculo", "codigo_veiculo", "vehicle_code")
+    placa = pick_value(dados, "placa", "plate").upper()
 
-    cd_veiculo = pick("cd_veiculo", "codigo_veiculo", "vehicle_code")
-    placa = pick("placa", "plate").upper()
-    dh_entrada = pick("dh_entrada", "data_hora_abertura", "opening_datetime")
-    dh_saida = pick("dh_saida", "data_hora_saida", "exit_datetime")
-    km_entrada = pick("km_entrada", "hodometro", "odometer")
-    km_saida = pick("km_saida", "hodometro_saida", "exit_odometer", "odometer")
-    dh_inicio = pick("dh_inicio", "data_hora_inicio", "start_datetime", "opening_datetime")
-    dh_prev = pick("dh_prev", "data_hora_previsao_liberacao", "expected_release_datetime", "exit_datetime")
-    cd_filial = pick("cd_filial", "codigo_filial", "branch_code", "filial")
-    cd_ccusto = pick("cd_ccusto", "codigo_departamento", "department_code")
-    cd_servico = pick("cd_servico", "codigo_servico", "service_code")
+    dh_entrada = pick_value(dados, "dh_entrada", "data_hora_abertura", "opening_datetime")
+    km_entrada = pick_value(dados, "km_entrada", "hodometro", "odometer")
+    dh_saida = pick_value(dados, "dh_saida", "data_hora_saida", "exit_datetime")
+    km_saida = pick_value(dados, "km_saida", "hodometro_saida", "exit_odometer", "odometer")
+    dh_inicio = pick_value(dados, "dh_inicio", "data_hora_inicio", "start_datetime", "opening_datetime")
+    dh_prev = pick_value(dados, "dh_prev", "data_hora_previsao_liberacao", "expected_release_datetime", "exit_datetime")
 
-    observacao = pick("observacao", "observacoes", "observations")
-    defeito = pick("descricao_defeito", "defect_description")
+    cd_filial = pick_value(dados, "cd_filial", "codigo_filial", "branch_code", "filial")
+    cd_ccusto = pick_value(dados, "cd_ccusto", "codigo_departamento", "department_code")
+
+    observacao = pick_value(dados, "observacao", "observacoes", "observations")
+    defeito = pick_value(dados, "descricao_defeito", "defect_description")
     if defeito:
         observacao = (observacao + " | " if observacao else "") + defeito
 
+    cd_servico = pick_value(dados, "cd_servico", "codigo_servico", "service_code")
     cd_servicos = dados.get("cd_servicos")
     if cd_servicos is None:
         cd_servicos = dados.get("codigo_servicos")
@@ -223,13 +209,12 @@ def montar_payload(dados: dict) -> dict:
         "cd_ccusto": cd_ccusto,
         "observacao": observacao,
         "cd_servico": cd_servico,
-        "cd_servicos": normalize_cd_servicos(cd_servicos),
-        "try_out": pick("try_out", default="PENDENTE_PAINEL"),
+        "cd_servicos": normalizar_lista(cd_servicos),
+        "try_out": pick_value(dados, "try_out", default="PENDENTE_PAINEL"),
     }
 
 
-
-def montar_payload_da_ordem(ordem: OrdemServico) -> dict:
+def montar_payload_frotaweb(ordem: OrdemServico) -> dict:
     return {
         "usuario": to_str(ordem.usuario),
         "senha": to_str(ordem.senha_frotaweb),
@@ -247,38 +232,39 @@ def montar_payload_da_ordem(ordem: OrdemServico) -> dict:
         "cd_ccusto": to_str(ordem.cd_ccusto),
         "observacao": to_str(ordem.observacao),
         "cd_servico": to_str(ordem.cd_servico),
-        "cd_servicos": ordem.cd_servicos.split(",") if ordem.cd_servicos else [],
+        "cd_servicos": normalizar_lista(ordem.cd_servicos),
         "try_out": to_str(ordem.try_out),
     }
 
-def enviar_para_outra_api(payload: dict):
+
+def enviar_para_frotaweb(payload: dict) -> dict:
     payload_api = dict(payload)
     payload_api.pop("try_out", None)
 
     try:
-        resp = requests.post(
-            INTEGRACAO_OUTRA_API_URL,
+        response = requests.post(
+            INTEGRACAO_FROTAWEB_URL,
             json=payload_api,
             timeout=120,
         )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Erro ao conectar na outra API: {str(e)}")
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Erro ao conectar na API FrotaWeb: {str(exc)}")
 
     try:
-        retorno = resp.json()
+        retorno = response.json()
     except Exception:
-        retorno = {"raw": resp.text}
+        retorno = {"raw": response.text}
 
-    if resp.status_code not in (200, 201):
+    if response.status_code not in (200, 201):
         raise HTTPException(
-            status_code=resp.status_code,
+            status_code=response.status_code,
             detail={"payload_enviado": payload_api, "retorno": retorno},
         )
 
     return retorno
 
 
-def aplicar_filtros_ordens(query, usuario, placa, cd_veiculo, try_out):
+def aplicar_filtros(query, usuario: Optional[str], placa: Optional[str], cd_veiculo: Optional[str], status_envio: Optional[str]):
     query = query.filter(OrdemServico.deleted_at.is_(None))
     if usuario:
         query = query.filter(OrdemServico.usuario.ilike(f"%{usuario}%"))
@@ -286,58 +272,84 @@ def aplicar_filtros_ordens(query, usuario, placa, cd_veiculo, try_out):
         query = query.filter(OrdemServico.placa.ilike(f"%{placa}%"))
     if cd_veiculo:
         query = query.filter(OrdemServico.cd_veiculo.ilike(f"%{cd_veiculo}%"))
-    if try_out:
-        query = query.filter(OrdemServico.try_out.ilike(f"%{try_out}%"))
+    if status_envio:
+        query = query.filter(OrdemServico.status_envio == status_envio)
     return query
 
 
-def buscar_veiculo_db(db: Session, placa: str):
-    placa_limpa = normalizar_placa(placa)
-    return (
-        db.query(VeiculoReferencia)
-        .filter(func.replace(func.replace(func.upper(VeiculoReferencia.placa), "-", ""), " ", "") == placa_limpa)
-        .first()
-    )
+def ordem_to_dict(ordem: OrdemServico) -> dict:
+    return {
+        "id": ordem.id,
+        "usuario": ordem.usuario,
+        "filial_login": ordem.filial_login,
+        "cd_empresa": ordem.cd_empresa,
+        "cd_veiculo": ordem.cd_veiculo,
+        "placa": ordem.placa,
+        "dh_entrada": ordem.dh_entrada,
+        "km_entrada": ordem.km_entrada,
+        "dh_saida": ordem.dh_saida,
+        "km_saida": ordem.km_saida,
+        "dh_inicio": ordem.dh_inicio,
+        "dh_prev": ordem.dh_prev,
+        "cd_filial": ordem.cd_filial,
+        "cd_ccusto": ordem.cd_ccusto,
+        "observacao": ordem.observacao,
+        "cd_servico": ordem.cd_servico,
+        "cd_servicos": normalizar_lista(ordem.cd_servicos),
+        "try_out": ordem.try_out,
+        "status_envio": ordem.status_envio,
+        "retorno_envio": ordem.retorno_envio,
+        "created_at": ordem.created_at.isoformat() if ordem.created_at else None,
+        "updated_at": ordem.updated_at.isoformat() if ordem.updated_at else None,
+    }
 
 # =========================================================
-# BASE HTML
+# HTML
 # =========================================================
 
-def render_base_html(titulo: str, corpo: str, mensagem: str = ""):
+def html_base(titulo: str, corpo: str, mensagem: str = "") -> str:
     return f"""
     <!DOCTYPE html>
     <html lang="pt-BR">
     <head>
-        <meta charset="UTF-8" />
-        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>{titulo}</title>
         <style>
-            body {{ font-family: Arial, sans-serif; background: #f4f6f9; margin: 0; padding: 24px; }}
-            .container {{ max-width: 1500px; margin: 0 auto; }}
-            .card {{ background: white; border-radius: 12px; padding: 20px; box-shadow: 0 2px 12px rgba(0,0,0,0.08); margin-bottom: 20px; }}
-            .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; align-items: end; }}
-            label {{ font-size: 14px; color: #374151; display: block; margin-bottom: 6px; font-weight: bold; }}
-            input {{ width: 100%; padding: 10px; border: 1px solid #d1d5db; border-radius: 8px; box-sizing: border-box; }}
-            button, .btn {{ background: #2563eb; color: white; border: none; padding: 10px 16px; border-radius: 8px; cursor: pointer; text-decoration: none; display: inline-block; font-size: 14px; }}
-            .btn-green {{ background: #059669; }}
-            .btn-danger {{ background: #dc2626; }}
-            .btn-gray {{ background: #374151; }}
-            .btn-orange {{ background: #ea580c; }}
-            .btn-dark {{ background: #111827; }}
-            .btn-purple {{ background: #7c3aed; }}
-            .acoes {{ display: flex; gap: 10px; flex-wrap: wrap; margin: 16px 0; }}
-            table {{ width: 100%; border-collapse: collapse; background: white; }}
-            th, td {{ padding: 12px; text-align: left; border-bottom: 1px solid #e5e7eb; vertical-align: top; font-size: 14px; }}
-            th {{ background: #111827; color: white; }}
-            tr:hover {{ background: #f9fafb; }}
-            .msg {{ background: #ecfdf5; color: #065f46; padding: 12px; border-radius: 8px; margin-bottom: 16px; font-weight: bold; }}
-            .hint {{ color: #6b7280; font-size: 14px; }}
-            @media (max-width: 768px) {{ body {{ padding: 12px; }} th, td {{ font-size: 12px; padding: 8px; }} }}
+            body {{ font-family: Arial, sans-serif; background:#f3f4f6; margin:0; padding:24px; color:#111827; }}
+            .container {{ max-width:1600px; margin:0 auto; }}
+            .topbar {{ display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap; }}
+            .card {{ background:#fff; border-radius:14px; padding:18px; box-shadow:0 2px 12px rgba(0,0,0,.08); margin-bottom:18px; }}
+            .grid {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:12px; align-items:end; }}
+            label {{ display:block; font-weight:700; margin-bottom:6px; color:#374151; font-size:14px; }}
+            input, select {{ width:100%; box-sizing:border-box; padding:10px; border:1px solid #d1d5db; border-radius:8px; }}
+            button, .btn {{ background:#2563eb; color:white; border:0; border-radius:8px; padding:10px 14px; cursor:pointer; text-decoration:none; display:inline-block; font-size:14px; }}
+            .btn-green {{ background:#059669; }}
+            .btn-red {{ background:#dc2626; }}
+            .btn-gray {{ background:#4b5563; }}
+            .btn-orange {{ background:#ea580c; }}
+            .acoes {{ display:flex; gap:8px; flex-wrap:wrap; margin-top:14px; }}
+            table {{ width:100%; border-collapse:collapse; background:white; }}
+            th, td {{ padding:10px; border-bottom:1px solid #e5e7eb; text-align:left; vertical-align:top; font-size:13px; }}
+            th {{ background:#111827; color:white; position:sticky; top:0; }}
+            tr:hover {{ background:#f9fafb; }}
+            .msg {{ background:#ecfdf5; color:#065f46; padding:12px; border-radius:8px; margin-bottom:14px; font-weight:700; }}
+            .status-pendente {{ color:#b45309; font-weight:800; }}
+            .status-enviada {{ color:#047857; font-weight:800; }}
+            .status-erro {{ color:#b91c1c; font-weight:800; }}
+            .small {{ color:#6b7280; font-size:12px; }}
+            .retorno {{ max-width:260px; white-space:normal; overflow-wrap:anywhere; color:#374151; }}
         </style>
     </head>
     <body>
         <div class="container">
-            <h1>{titulo}</h1>
+            <div class="topbar">
+                <div>
+                    <h1>{titulo}</h1>
+                    <div class="small">App salva no painel. Envio ao FrotaWeb somente pelo botao Enviar FrotaWeb.</div>
+                </div>
+                <a class="btn btn-gray" href="/docs">Docs</a>
+            </div>
             {f'<div class="msg">{mensagem}</div>' if mensagem else ''}
             {corpo}
         </div>
@@ -345,70 +357,71 @@ def render_base_html(titulo: str, corpo: str, mensagem: str = ""):
     </html>
     """
 
-# =========================================================
-# HTML ORDENS
-# =========================================================
 
-
-def render_ordens_html(ordens, filtros, mensagem: str = ""):
+def render_painel_ordens(ordens: list[OrdemServico], filtros: dict, mensagem: str = "") -> str:
     linhas = ""
-    for item in ordens:
-        status = item.status_envio or "PENDENTE"
-        retorno_curto = (item.retorno_envio or "")
-        if len(retorno_curto) > 180:
-            retorno_curto = retorno_curto[:180] + "..."
+    for ordem in ordens:
+        status = ordem.status_envio or "PENDENTE"
+        status_class = "status-pendente"
+        if status == "ENVIADA":
+            status_class = "status-enviada"
+        elif status.startswith("ERRO"):
+            status_class = "status-erro"
+
+        retorno = ordem.retorno_envio or ""
+        if len(retorno) > 250:
+            retorno = retorno[:250] + "..."
 
         if status == "ENVIADA":
-            acao = "<span style='color:#059669;font-weight:bold;'>Enviada</span>"
+            acao = "<span class='status-enviada'>Enviada</span>"
         else:
             acao = f"""
-            <form method="post" action="/painel/ordens-servico/enviar/{item.id}" onsubmit="return confirm('Enviar esta O.S. para o FrotaWeb agora?')">
+            <form method="post" action="/painel/ordens-servico/enviar/{ordem.id}"
+                  onsubmit="return confirm('Enviar a O.S. {ordem.id} para o FrotaWeb agora?');">
                 <button class="btn-green" type="submit">Enviar FrotaWeb</button>
             </form>
             """
 
         linhas += f"""
         <tr>
-            <td>{item.id}</td>
-            <td>{item.usuario or ""}</td>
-            <td>{item.placa or ""}</td>
-            <td>{item.cd_veiculo or ""}</td>
-            <td>{item.cd_filial or ""}</td>
-            <td>{item.cd_servico or ""}</td>
-            <td><b>{status}</b></td>
-            <td>{item.try_out or ""}</td>
-            <td>{item.observacao or ""}</td>
-            <td>{retorno_curto}</td>
-            <td>{item.created_at.strftime("%d/%m/%Y %H:%M") if item.created_at else ""}</td>
+            <td>{ordem.id}</td>
+            <td><span class="{status_class}">{status}</span></td>
+            <td>{ordem.usuario or ""}</td>
+            <td>{ordem.placa or ""}</td>
+            <td>{ordem.cd_veiculo or ""}</td>
+            <td>{ordem.cd_filial or ""}</td>
+            <td>{ordem.cd_ccusto or ""}</td>
+            <td>{ordem.km_entrada or ""}</td>
+            <td>{ordem.dh_entrada or ""}</td>
+            <td>{ordem.dh_saida or ""}</td>
+            <td>{ordem.observacao or ""}</td>
+            <td class="retorno">{retorno}</td>
+            <td>{ordem.created_at.strftime("%d/%m/%Y %H:%M") if ordem.created_at else ""}</td>
             <td>{acao}</td>
         </tr>
         """
 
     corpo = f"""
     <div class="card">
-        <div class="acoes" style="margin-top:0;">
-            <a class="btn btn-orange" href="/painel/veiculos">Cadastro de Veiculos</a>
-            <a class="btn btn-dark" href="/painel/usuarios">Cadastro de Usuarios</a>
-            <a class="btn btn-purple" href="/painel/servicos">Cadastro de Servicos</a>
-        </div>
-        <p class="hint">
-            Fluxo: o app salva a O.S. aqui no painel como <b>PENDENTE</b>. Depois de conferir, clique em <b>Enviar FrotaWeb</b>.
-        </p>
-    </div>
-
-    <div class="card">
         <form method="get" action="/painel/ordens-servico">
             <div class="grid">
-                <div><label>Usuario</label><input type="text" name="usuario" value="{filtros.get("usuario", "")}"></div>
-                <div><label>Placa</label><input type="text" name="placa" value="{filtros.get("placa", "")}"></div>
-                <div><label>Codigo do veiculo</label><input type="text" name="cd_veiculo" value="{filtros.get("cd_veiculo", "")}"></div>
-                <div><label>Try Out</label><input type="text" name="try_out" value="{filtros.get("try_out", "")}"></div>
+                <div>
+                    <label>Status</label>
+                    <select name="status_envio">
+                        <option value="" {"selected" if not filtros.get("status_envio") else ""}>Todos</option>
+                        <option value="PENDENTE" {"selected" if filtros.get("status_envio") == "PENDENTE" else ""}>Pendente</option>
+                        <option value="ENVIADA" {"selected" if filtros.get("status_envio") == "ENVIADA" else ""}>Enviada</option>
+                        <option value="ERRO_ENVIO" {"selected" if filtros.get("status_envio") == "ERRO_ENVIO" else ""}>Erro</option>
+                    </select>
+                </div>
+                <div><label>Usuario</label><input name="usuario" value="{filtros.get("usuario", "")}"></div>
+                <div><label>Placa</label><input name="placa" value="{filtros.get("placa", "")}"></div>
+                <div><label>Codigo veiculo</label><input name="cd_veiculo" value="{filtros.get("cd_veiculo", "")}"></div>
             </div>
             <div class="acoes">
                 <button type="submit">Filtrar</button>
-                <a class="btn btn-green" href="/painel/ordens-servico/exportar/xlsx?usuario={filtros.get("usuario", "")}&placa={filtros.get("placa", "")}&cd_veiculo={filtros.get("cd_veiculo", "")}&try_out={filtros.get("try_out", "")}">Exportar XLSX</a>
-                <a class="btn btn-purple" href="/painel/ordens-servico/exportar/json?usuario={filtros.get("usuario", "")}&placa={filtros.get("placa", "")}&cd_veiculo={filtros.get("cd_veiculo", "")}&try_out={filtros.get("try_out", "")}">Exportar JSON</a>
                 <a class="btn btn-gray" href="/painel/ordens-servico">Limpar</a>
+                <a class="btn btn-orange" href="/ordens-servico">Ver JSON</a>
             </div>
         </form>
     </div>
@@ -417,255 +430,41 @@ def render_ordens_html(ordens, filtros, mensagem: str = ""):
         <table>
             <thead>
                 <tr>
-                    <th>ID</th><th>Usuario</th><th>Placa</th><th>CD Veiculo</th><th>CD Filial</th><th>CD Servico</th><th>Status</th><th>Try Out</th><th>Observacao</th><th>Retorno</th><th>Criado em</th><th>Acao</th>
+                    <th>ID</th>
+                    <th>Status</th>
+                    <th>Usuario</th>
+                    <th>Placa</th>
+                    <th>CD Veiculo</th>
+                    <th>CD Filial</th>
+                    <th>CD Custo</th>
+                    <th>KM</th>
+                    <th>Entrada</th>
+                    <th>Saida</th>
+                    <th>Observacao</th>
+                    <th>Retorno</th>
+                    <th>Criado em</th>
+                    <th>Acao</th>
                 </tr>
             </thead>
-            <tbody>{linhas if linhas else '<tr><td colspan="12">Nenhum registro encontrado</td></tr>'}</tbody>
+            <tbody>{linhas if linhas else '<tr><td colspan="14">Nenhuma O.S. encontrada</td></tr>'}</tbody>
         </table>
     </div>
     """
-    return render_base_html("Painel de Ordens de Servico", corpo, mensagem)
+
+    return html_base("Painel de O.S. Corretiva", corpo, mensagem)
 
 # =========================================================
-# HTML VEICULOS
-# =========================================================
-
-def render_veiculos_html(veiculos, busca="", mensagem=""):
-    linhas = ""
-    for item in veiculos:
-        linhas += f"""
-        <tr>
-            <td>{item.id}</td>
-            <td>{item.placa}</td>
-            <td>{item.cd_veiculo}</td>
-            <td>{item.cd_filial}</td>
-            <td>{item.cd_ccusto}</td>
-            <td>{item.created_at.strftime("%d/%m/%Y %H:%M") if item.created_at else ""}</td>
-            <td>
-                <form method="post" action="/painel/veiculos/excluir/{item.id}" onsubmit="return confirm('Excluir este veiculo?')">
-                    <button class="btn-danger" type="submit">Excluir</button>
-                </form>
-            </td>
-        </tr>
-        """
-
-    corpo = f"""
-    <div class="acoes">
-        <a class="btn btn-gray" href="/painel/ordens-servico">Voltar para O.S.</a>
-        <a class="btn btn-dark" href="/painel/usuarios">Cadastro de Usuarios</a>
-        <a class="btn btn-purple" href="/painel/servicos">Cadastro de Servicos</a>
-    </div>
-
-    <div class="card">
-        <h2>Adicionar ou atualizar veiculo</h2>
-        <form method="post" action="/painel/veiculos/adicionar">
-            <div class="grid">
-                <div><label>Placa</label><input name="placa" placeholder="Ex.: SBB2B33" required></div>
-                <div><label>Codigo de frota</label><input name="cd_veiculo" placeholder="Ex.: 12040" required></div>
-                <div><label>Filial da O.S.</label><input name="cd_filial" placeholder="Ex.: 1" required></div>
-                <div><label>Centro de custo</label><input name="cd_ccusto" placeholder="Ex.: 420119" required></div>
-            </div>
-            <div class="acoes"><button type="submit">Salvar veiculo</button></div>
-        </form>
-    </div>
-
-    <div class="card">
-        <h2>Importar lote via XLSX</h2>
-        <form method="post" action="/painel/veiculos/importar-xlsx" enctype="multipart/form-data">
-            <input type="file" name="arquivo" accept=".xlsx" required>
-            <div class="acoes"><button class="btn-green" type="submit">Importar XLSX</button></div>
-        </form>
-        <p class="hint">Colunas obrigatorias: <b>placa</b>, <b>cd_veiculo</b>, <b>cd_filial</b>, <b>cd_ccusto</b>.</p>
-    </div>
-
-    <div class="card">
-        <h2>Pesquisar</h2>
-        <form method="get" action="/painel/veiculos">
-            <div class="grid">
-                <div><label>Buscar por placa</label><input name="busca" value="{busca}" placeholder="Digite uma placa"></div>
-            </div>
-            <div class="acoes"><button type="submit">Buscar</button><a class="btn btn-gray" href="/painel/veiculos">Limpar</a></div>
-        </form>
-    </div>
-
-    <div class="card" style="padding:0; overflow:auto;">
-        <table>
-            <thead>
-                <tr><th>ID</th><th>Placa</th><th>Codigo Frota</th><th>Filial O.S.</th><th>Centro Custo</th><th>Criado em</th><th>Acao</th></tr>
-            </thead>
-            <tbody>{linhas if linhas else '<tr><td colspan="7">Nenhum veiculo cadastrado</td></tr>'}</tbody>
-        </table>
-    </div>
-    """
-    return render_base_html("Cadastro de Veiculos", corpo, mensagem)
-
-# =========================================================
-# HTML USUARIOS
-# =========================================================
-
-def render_usuarios_html(usuarios, busca="", mensagem=""):
-    linhas = ""
-    for item in usuarios:
-        linhas += f"""
-        <tr>
-            <td>{item.id}</td>
-            <td>{item.matricula}</td>
-            <td>{item.nome_completo}</td>
-            <td>{item.cpf or ""}</td>
-            <td>{item.funcao}</td>
-            <td>{item.created_at.strftime("%d/%m/%Y %H:%M") if item.created_at else ""}</td>
-            <td>
-                <form method="post" action="/painel/usuarios/excluir/{item.id}" onsubmit="return confirm('Excluir este usuario?')">
-                    <button class="btn-danger" type="submit">Excluir</button>
-                </form>
-            </td>
-        </tr>
-        """
-
-    corpo = f"""
-    <div class="acoes">
-        <a class="btn btn-gray" href="/painel/ordens-servico">Voltar para O.S.</a>
-        <a class="btn btn-orange" href="/painel/veiculos">Cadastro de Veiculos</a>
-        <a class="btn btn-purple" href="/painel/servicos">Cadastro de Servicos</a>
-    </div>
-
-    <div class="card">
-        <h2>Adicionar ou atualizar usuario</h2>
-        <form method="post" action="/painel/usuarios/adicionar">
-            <div class="grid">
-                <div><label>Matricula</label><input name="matricula" required></div>
-                <div><label>Senha</label><input name="senha" required></div>
-                <div><label>CPF opcional</label><input name="cpf"></div>
-                <div><label>Nome completo</label><input name="nome_completo" required></div>
-                <div><label>Funcao</label><input name="funcao" placeholder="Ex.: Mecanico" required></div>
-            </div>
-            <div class="acoes"><button type="submit">Salvar usuario</button></div>
-        </form>
-    </div>
-
-    <div class="card">
-        <h2>Importar lote via XLSX</h2>
-        <form method="post" action="/painel/usuarios/importar-xlsx" enctype="multipart/form-data">
-            <input type="file" name="arquivo" accept=".xlsx" required>
-            <div class="acoes"><button class="btn-green" type="submit">Importar XLSX</button></div>
-        </form>
-        <p class="hint">Colunas obrigatorias: <b>matricula</b>, <b>senha</b>, <b>nome_completo</b>, <b>funcao</b>. Opcional: <b>cpf</b>.</p>
-    </div>
-
-    <div class="card">
-        <h2>Pesquisar</h2>
-        <form method="get" action="/painel/usuarios">
-            <div class="grid">
-                <div><label>Buscar por matricula ou nome</label><input name="busca" value="{busca}" placeholder="Digite matricula ou nome"></div>
-            </div>
-            <div class="acoes"><button type="submit">Buscar</button><a class="btn btn-gray" href="/painel/usuarios">Limpar</a></div>
-        </form>
-    </div>
-
-    <div class="card" style="padding:0; overflow:auto;">
-        <table>
-            <thead>
-                <tr><th>ID</th><th>Matricula</th><th>Nome completo</th><th>CPF</th><th>Funcao</th><th>Criado em</th><th>Acao</th></tr>
-            </thead>
-            <tbody>{linhas if linhas else '<tr><td colspan="7">Nenhum usuario cadastrado</td></tr>'}</tbody>
-        </table>
-    </div>
-    """
-    return render_base_html("Cadastro de Usuarios", corpo, mensagem)
-
-# =========================================================
-# HTML SERVICOS
-# =========================================================
-
-def render_servicos_html(servicos, busca="", mensagem=""):
-    linhas = ""
-    for item in servicos:
-        linhas += f"""
-        <tr>
-            <td>{item.id}</td>
-            <td>{item.cd_grpserv or ""}</td>
-            <td>{item.cd_servico}</td>
-            <td>{item.nm_servico}</td>
-            <td>{item.cd_empresa or ""}</td>
-            <td>{item.bl_inativo or ""}</td>
-            <td>{item.nm_grpserv or ""}</td>
-            <td>{item.nm_empresa or ""}</td>
-            <td>{item.created_at.strftime("%d/%m/%Y %H:%M") if item.created_at else ""}</td>
-            <td>
-                <form method="post" action="/painel/servicos/excluir/{item.id}" onsubmit="return confirm('Excluir este servico?')">
-                    <button class="btn-danger" type="submit">Excluir</button>
-                </form>
-            </td>
-        </tr>
-        """
-
-    corpo = f"""
-    <div class="acoes">
-        <a class="btn btn-gray" href="/painel/ordens-servico">Voltar para O.S.</a>
-        <a class="btn btn-orange" href="/painel/veiculos">Cadastro de Veiculos</a>
-        <a class="btn btn-dark" href="/painel/usuarios">Cadastro de Usuarios</a>
-    </div>
-
-    <div class="card">
-        <h2>Adicionar ou atualizar servico</h2>
-        <form method="post" action="/painel/servicos/adicionar">
-            <div class="grid">
-                <div><label>CD Grupo Servico</label><input name="cd_grpserv" placeholder="Ex.: 1"></div>
-                <div><label>CD Servico</label><input name="cd_servico" placeholder="Ex.: 4194" required></div>
-                <div><label>Nome do servico</label><input name="nm_servico" placeholder="Ex.: TROCAR VALVULA..." required></div>
-                <div><label>CD Empresa</label><input name="cd_empresa" placeholder="Ex.: 1"></div>
-                <div><label>BL Inativo</label><input name="bl_inativo" placeholder="Ex.: 0 ou 1"></div>
-                <div><label>Nome grupo</label><input name="nm_grpserv" placeholder="Ex.: Motor"></div>
-                <div><label>Nome empresa</label><input name="nm_empresa" placeholder="Ex.: Unica"></div>
-            </div>
-            <div class="acoes"><button type="submit">Salvar servico</button></div>
-        </form>
-    </div>
-
-    <div class="card">
-        <h2>Importar lote via XLSX</h2>
-        <form method="post" action="/painel/servicos/importar-xlsx" enctype="multipart/form-data">
-            <input type="file" name="arquivo" accept=".xlsx" required>
-            <div class="acoes"><button class="btn-green" type="submit">Importar XLSX</button></div>
-        </form>
-        <p class="hint">Colunas obrigatorias conforme planilha: <b>cd_grpserv</b>, <b>cd_servico</b>, <b>nm_servico</b>, <b>cd_empresa</b>, <b>bl_inativo</b>, <b>nm_grpserv</b>, <b>nm_empresa</b>.</p>
-    </div>
-
-    <div class="card">
-        <h2>Pesquisar</h2>
-        <form method="get" action="/painel/servicos">
-            <div class="grid">
-                <div><label>Buscar por codigo ou nome</label><input name="busca" value="{busca}" placeholder="Digite codigo ou nome"></div>
-            </div>
-            <div class="acoes"><button type="submit">Buscar</button><a class="btn btn-gray" href="/painel/servicos">Limpar</a></div>
-        </form>
-    </div>
-
-    <div class="card" style="padding:0; overflow:auto;">
-        <table>
-            <thead>
-                <tr>
-                    <th>ID</th><th>CD Grupo</th><th>CD Servico</th><th>Nome Servico</th><th>CD Empresa</th><th>Inativo</th><th>Grupo</th><th>Empresa</th><th>Criado em</th><th>Acao</th>
-                </tr>
-            </thead>
-            <tbody>{linhas if linhas else '<tr><td colspan="10">Nenhum servico cadastrado</td></tr>'}</tbody>
-        </table>
-    </div>
-    """
-    return render_base_html("Cadastro de Servicos", corpo, mensagem)
-
-# =========================================================
-# ROTAS BASICAS
+# ROTAS
 # =========================================================
 
 @app.get("/")
 def home():
     return {
-        "message": "API de Ordens de Servico online",
-        "painel_ordens": "/painel/ordens-servico",
-        "painel_veiculos": "/painel/veiculos",
-        "painel_usuarios": "/painel/usuarios",
-        "painel_servicos": "/painel/servicos",
+        "status": "online",
+        "painel": "/painel/ordens-servico",
+        "receber_os_app": "POST /panel/os",
+        "receber_os_api": "POST /ordens-servico",
+        "enviar_frotaweb": "POST /painel/ordens-servico/enviar/{ordem_id}",
         "docs": "/docs",
     }
 
@@ -674,27 +473,26 @@ def home():
 def health():
     return {"status": "ok"}
 
-# =========================================================
-# ROTAS ORDENS
-# =========================================================
-
 
 @app.post("/ordens-servico")
 async def criar_ordem_servico(request: Request, db: Session = Depends(get_db)):
     """
-    Salva a O.S. no painel para conferencia.
+    Salva a O.S. no painel com status PENDENTE.
     Nao envia automaticamente para o FrotaWeb.
-    O envio ao FrotaWeb e feito depois pelo botao no painel.
     """
     try:
         dados = await request.json()
     except Exception:
         raise HTTPException(status_code=400, detail="JSON invalido")
 
-    payload = montar_payload(dados)
+    payload = montar_payload_painel(dados)
+
+    if not payload["placa"] and not payload["cd_veiculo"]:
+        raise HTTPException(status_code=400, detail="Informe placa ou cd_veiculo")
 
     nova = OrdemServico(
         usuario=payload["usuario"],
+        senha_frotaweb=payload["senha"],
         filial_login=payload["filial_login"],
         cd_empresa=payload["cd_empresa"],
         cd_veiculo=payload["cd_veiculo"],
@@ -712,8 +510,8 @@ async def criar_ordem_servico(request: Request, db: Session = Depends(get_db)):
         cd_servicos=",".join(payload["cd_servicos"]),
         try_out=payload["try_out"],
         status_envio="PENDENTE",
-        retorno_envio="Salva no painel. Aguardando conferencia e envio manual ao FrotaWeb.",
-        senha_frotaweb=payload["senha"],
+        retorno_envio="O.S. salva no painel. Aguardando conferencia e envio manual ao FrotaWeb.",
+        payload_original=str(dados),
     )
 
     db.add(nova)
@@ -729,29 +527,70 @@ async def criar_ordem_servico(request: Request, db: Session = Depends(get_db)):
         "order_number": str(nova.id),
         "status_envio": nova.status_envio,
         "message": "O.S. salva no painel para conferencia. Nao foi enviada ao FrotaWeb.",
-        "payload_recebido": payload,
+        "painel": "/painel/ordens-servico",
     }
 
 
 @app.post("/panel/os")
-async def criar_ordem_servico_app_alias(request: Request, db: Session = Depends(get_db)):
+async def criar_ordem_servico_app(request: Request, db: Session = Depends(get_db)):
     """
-    Alias para o app Android.
-    Permite o app chamar /panel/os e salvar no mesmo painel.
+    Rota para o app Android.
+    O app deve chamar POST /panel/os.
     """
     return await criar_ordem_servico(request=request, db=db)
 
 
+@app.get("/ordens-servico")
+def listar_ordens_servico(
+    usuario: Optional[str] = Query(None),
+    placa: Optional[str] = Query(None),
+    cd_veiculo: Optional[str] = Query(None),
+    status_envio: Optional[str] = Query(None),
+    db: Session = Depends(get_db),
+):
+    query = aplicar_filtros(db.query(OrdemServico), usuario, placa, cd_veiculo, status_envio)
+    registros = query.order_by(OrdemServico.created_at.desc()).all()
+    return [ordem_to_dict(item) for item in registros]
+
+
+@app.get("/painel/ordens-servico", response_class=HTMLResponse)
+def painel_ordens_servico(
+    usuario: Optional[str] = Query(None),
+    placa: Optional[str] = Query(None),
+    cd_veiculo: Optional[str] = Query(None),
+    status_envio: Optional[str] = Query(None),
+    msg: Optional[str] = Query(None),
+    db: Session = Depends(get_db),
+):
+    query = aplicar_filtros(db.query(OrdemServico), usuario, placa, cd_veiculo, status_envio)
+    ordens = query.order_by(OrdemServico.created_at.desc()).all()
+
+    filtros = {
+        "usuario": usuario or "",
+        "placa": placa or "",
+        "cd_veiculo": cd_veiculo or "",
+        "status_envio": status_envio or "",
+    }
+
+    return HTMLResponse(render_painel_ordens(ordens, filtros, msg or ""))
+
+
 @app.post("/painel/ordens-servico/enviar/{ordem_id}")
-def enviar_ordem_pendente_para_frotaweb(ordem_id: int, db: Session = Depends(get_db)):
-    ordem = db.query(OrdemServico).filter(OrdemServico.id == ordem_id).filter(OrdemServico.deleted_at.is_(None)).first()
+def enviar_ordem_para_frotaweb(ordem_id: int, db: Session = Depends(get_db)):
+    ordem = (
+        db.query(OrdemServico)
+        .filter(OrdemServico.id == ordem_id)
+        .filter(OrdemServico.deleted_at.is_(None))
+        .first()
+    )
+
     if not ordem:
         raise HTTPException(status_code=404, detail="O.S. nao encontrada")
 
-    payload = montar_payload_da_ordem(ordem)
+    payload = montar_payload_frotaweb(ordem)
 
     try:
-        retorno = enviar_para_outra_api(payload)
+        retorno = enviar_para_frotaweb(payload)
     except HTTPException as exc:
         ordem.status_envio = "ERRO_ENVIO"
         ordem.retorno_envio = str(exc.detail)
@@ -772,13 +611,19 @@ def enviar_ordem_pendente_para_frotaweb(ordem_id: int, db: Session = Depends(get
 
 
 @app.post("/ordens-servico/{ordem_id}/enviar-frotaweb")
-def enviar_ordem_pendente_para_frotaweb_json(ordem_id: int, db: Session = Depends(get_db)):
-    ordem = db.query(OrdemServico).filter(OrdemServico.id == ordem_id).filter(OrdemServico.deleted_at.is_(None)).first()
+def enviar_ordem_para_frotaweb_json(ordem_id: int, db: Session = Depends(get_db)):
+    ordem = (
+        db.query(OrdemServico)
+        .filter(OrdemServico.id == ordem_id)
+        .filter(OrdemServico.deleted_at.is_(None))
+        .first()
+    )
+
     if not ordem:
         raise HTTPException(status_code=404, detail="O.S. nao encontrada")
 
-    payload = montar_payload_da_ordem(ordem)
-    retorno = enviar_para_outra_api(payload)
+    payload = montar_payload_frotaweb(ordem)
+    retorno = enviar_para_frotaweb(payload)
 
     ordem.status_envio = "ENVIADA"
     ordem.retorno_envio = str(retorno)
@@ -793,572 +638,12 @@ def enviar_ordem_pendente_para_frotaweb_json(ordem_id: int, db: Session = Depend
     }
 
 
-@app.get("/ordens-servico")
-def listar_ordens_servico(
-    usuario: Optional[str] = Query(None),
-    placa: Optional[str] = Query(None),
-    cd_veiculo: Optional[str] = Query(None),
-    try_out: Optional[str] = Query(None),
-    db: Session = Depends(get_db),
-):
-    query = db.query(OrdemServico)
-    query = aplicar_filtros_ordens(query, usuario, placa, cd_veiculo, try_out)
-    registros = query.order_by(OrdemServico.created_at.desc()).all()
+@app.delete("/ordens-servico/{ordem_id}")
+def excluir_ordem(ordem_id: int, db: Session = Depends(get_db)):
+    ordem = db.query(OrdemServico).filter(OrdemServico.id == ordem_id).first()
+    if not ordem:
+        raise HTTPException(status_code=404, detail="O.S. nao encontrada")
 
-    return [
-        {
-            "id": item.id,
-            "usuario": item.usuario,
-            "filial_login": item.filial_login,
-            "cd_empresa": item.cd_empresa,
-            "cd_veiculo": item.cd_veiculo,
-            "placa": item.placa,
-            "dh_entrada": item.dh_entrada,
-            "km_entrada": item.km_entrada,
-            "dh_saida": item.dh_saida,
-            "km_saida": item.km_saida,
-            "dh_inicio": item.dh_inicio,
-            "dh_prev": item.dh_prev,
-            "cd_filial": item.cd_filial,
-            "cd_ccusto": item.cd_ccusto,
-            "observacao": item.observacao,
-            "cd_servico": item.cd_servico,
-            "cd_servicos": item.cd_servicos.split(",") if item.cd_servicos else [],
-            "try_out": item.try_out,
-            "status_envio": item.status_envio,
-            "retorno_envio": item.retorno_envio,
-            "created_at": item.created_at.isoformat() if item.created_at else None,
-            "updated_at": item.updated_at.isoformat() if item.updated_at else None,
-        }
-        for item in registros
-    ]
-
-
-@app.get("/painel/ordens-servico", response_class=HTMLResponse)
-def painel_ordens_servico(
-    usuario: Optional[str] = Query(None),
-    placa: Optional[str] = Query(None),
-    cd_veiculo: Optional[str] = Query(None),
-    try_out: Optional[str] = Query(None),
-    msg: Optional[str] = Query(None),
-    db: Session = Depends(get_db),
-):
-    query = db.query(OrdemServico)
-    query = aplicar_filtros_ordens(query, usuario, placa, cd_veiculo, try_out)
-    ordens = query.order_by(OrdemServico.created_at.desc()).all()
-
-    filtros = {
-        "usuario": usuario or "",
-        "placa": placa or "",
-        "cd_veiculo": cd_veiculo or "",
-        "try_out": try_out or "",
-    }
-
-    return HTMLResponse(content=render_ordens_html(ordens, filtros, msg or ""))
-
-
-@app.get("/painel/ordens-servico/exportar/xlsx")
-def exportar_ordens_xlsx(
-    usuario: Optional[str] = Query(None),
-    placa: Optional[str] = Query(None),
-    cd_veiculo: Optional[str] = Query(None),
-    try_out: Optional[str] = Query(None),
-    db: Session = Depends(get_db),
-):
-    query = db.query(OrdemServico)
-    query = aplicar_filtros_ordens(query, usuario, placa, cd_veiculo, try_out)
-    registros = query.order_by(OrdemServico.created_at.desc()).all()
-
-    dados = []
-    for item in registros:
-        dados.append({
-            "ID": item.id,
-            "Usuario": item.usuario,
-            "Filial Login": item.filial_login,
-            "CD Empresa": item.cd_empresa,
-            "CD Veiculo": item.cd_veiculo,
-            "Placa": item.placa,
-            "DH Entrada": item.dh_entrada,
-            "KM Entrada": item.km_entrada,
-            "DH Saida": item.dh_saida,
-            "KM Saida": item.km_saida,
-            "DH Inicio": item.dh_inicio,
-            "DH Prev": item.dh_prev,
-            "CD Filial": item.cd_filial,
-            "CD CCusto": item.cd_ccusto,
-            "Observacao": item.observacao,
-            "CD Servico": item.cd_servico,
-            "CD Servicos": item.cd_servicos,
-            "Try Out": item.try_out,
-            "Status Envio": item.status_envio,
-            "Retorno Envio": item.retorno_envio,
-            "Criado em": item.created_at.strftime("%d/%m/%Y %H:%M") if item.created_at else "",
-        })
-
-    df = pd.DataFrame(dados)
-    output = BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="OrdensServico")
-    output.seek(0)
-
-    return StreamingResponse(
-        output,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": "attachment; filename=ordens_servico.xlsx"},
-    )
-
-
-@app.get("/painel/ordens-servico/exportar/json")
-def exportar_ordens_json(
-    usuario: Optional[str] = Query(None),
-    placa: Optional[str] = Query(None),
-    cd_veiculo: Optional[str] = Query(None),
-    try_out: Optional[str] = Query(None),
-    db: Session = Depends(get_db),
-):
-    query = db.query(OrdemServico)
-    query = aplicar_filtros_ordens(query, usuario, placa, cd_veiculo, try_out)
-    registros = query.order_by(OrdemServico.created_at.desc()).all()
-    return JSONResponse(content=[
-        {
-            "id": item.id,
-            "usuario": item.usuario,
-            "filial_login": item.filial_login,
-            "cd_empresa": item.cd_empresa,
-            "cd_veiculo": item.cd_veiculo,
-            "placa": item.placa,
-            "dh_entrada": item.dh_entrada,
-            "km_entrada": item.km_entrada,
-            "dh_saida": item.dh_saida,
-            "km_saida": item.km_saida,
-            "dh_inicio": item.dh_inicio,
-            "dh_prev": item.dh_prev,
-            "cd_filial": item.cd_filial,
-            "cd_ccusto": item.cd_ccusto,
-            "observacao": item.observacao,
-            "cd_servico": item.cd_servico,
-            "cd_servicos": item.cd_servicos.split(",") if item.cd_servicos else [],
-            "try_out": item.try_out,
-            "status_envio": item.status_envio,
-            "retorno_envio": item.retorno_envio,
-            "created_at": item.created_at.isoformat() if item.created_at else None,
-            "updated_at": item.updated_at.isoformat() if item.updated_at else None,
-        }
-        for item in registros
-    ])
-
-# =========================================================
-# ROTAS VEICULOS
-# =========================================================
-
-@app.get("/veiculos/placa/{placa}")
-def buscar_veiculo_por_placa(placa: str, db: Session = Depends(get_db)):
-    veiculo = buscar_veiculo_db(db, placa)
-    if not veiculo:
-        raise HTTPException(status_code=404, detail="Veiculo nao encontrado")
-    return {
-        "id": veiculo.id,
-        "placa": veiculo.placa,
-        "cd_veiculo": veiculo.cd_veiculo,
-        "cd_filial": veiculo.cd_filial,
-        "cd_ccusto": veiculo.cd_ccusto,
-    }
-
-
-@app.get("/veiculos")
-def listar_veiculos(busca: Optional[str] = Query(None), db: Session = Depends(get_db)):
-    query = db.query(VeiculoReferencia)
-    if busca:
-        query = query.filter(VeiculoReferencia.placa.ilike(f"%{busca}%"))
-    veiculos = query.order_by(VeiculoReferencia.placa.asc()).all()
-    return [
-        {
-            "id": item.id,
-            "placa": item.placa,
-            "cd_veiculo": item.cd_veiculo,
-            "cd_filial": item.cd_filial,
-            "cd_ccusto": item.cd_ccusto,
-            "created_at": item.created_at.isoformat() if item.created_at else None,
-        }
-        for item in veiculos
-    ]
-
-
-@app.get("/painel/veiculos", response_class=HTMLResponse)
-def painel_veiculos(busca: Optional[str] = Query(None), msg: Optional[str] = Query(None), db: Session = Depends(get_db)):
-    query = db.query(VeiculoReferencia)
-    if busca:
-        query = query.filter(VeiculoReferencia.placa.ilike(f"%{busca}%"))
-    veiculos = query.order_by(VeiculoReferencia.placa.asc()).all()
-    return HTMLResponse(content=render_veiculos_html(veiculos, busca or "", msg or ""))
-
-
-@app.post("/painel/veiculos/adicionar")
-async def adicionar_veiculo(request: Request, db: Session = Depends(get_db)):
-    form = await request.form()
-    placa = to_str(form.get("placa")).upper()
-    cd_veiculo = to_str(form.get("cd_veiculo"))
-    cd_filial = to_str(form.get("cd_filial"))
-    cd_ccusto = to_str(form.get("cd_ccusto"))
-
-    if not placa or not cd_veiculo or not cd_filial or not cd_ccusto:
-        raise HTTPException(status_code=400, detail="Todos os campos sao obrigatorios")
-
-    existente = buscar_veiculo_db(db, placa)
-    if existente:
-        existente.placa = placa
-        existente.cd_veiculo = cd_veiculo
-        existente.cd_filial = cd_filial
-        existente.cd_ccusto = cd_ccusto
-        mensagem = "Veiculo atualizado com sucesso"
-    else:
-        db.add(VeiculoReferencia(placa=placa, cd_veiculo=cd_veiculo, cd_filial=cd_filial, cd_ccusto=cd_ccusto))
-        mensagem = "Veiculo cadastrado com sucesso"
-
+    ordem.deleted_at = func.now()
     db.commit()
-    return RedirectResponse(url=f"/painel/veiculos?msg={mensagem}", status_code=303)
-
-
-@app.post("/painel/veiculos/excluir/{veiculo_id}")
-def excluir_veiculo(veiculo_id: int, db: Session = Depends(get_db)):
-    veiculo = db.query(VeiculoReferencia).filter(VeiculoReferencia.id == veiculo_id).first()
-    if veiculo:
-        db.delete(veiculo)
-        db.commit()
-    return RedirectResponse(url="/painel/veiculos?msg=Veiculo excluido com sucesso", status_code=303)
-
-
-@app.post("/painel/veiculos/importar-xlsx")
-async def importar_veiculos_xlsx(arquivo: UploadFile = File(...), db: Session = Depends(get_db)):
-    if not arquivo.filename.lower().endswith(".xlsx"):
-        raise HTTPException(status_code=400, detail="Envie um arquivo .xlsx")
-
-    try:
-        df = pd.read_excel(BytesIO(await arquivo.read()))
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Erro ao ler XLSX: {str(e)}")
-
-    df.columns = [str(c).strip().lower() for c in df.columns]
-    colunas_obrigatorias = {"placa", "cd_veiculo", "cd_filial", "cd_ccusto"}
-    if not colunas_obrigatorias.issubset(set(df.columns)):
-        raise HTTPException(status_code=400, detail="O XLSX precisa ter as colunas: placa, cd_veiculo, cd_filial, cd_ccusto")
-
-    total_processado = total_criado = total_atualizado = 0
-    for _, row in df.iterrows():
-        placa = to_str(row.get("placa")).upper()
-        cd_veiculo = to_str(row.get("cd_veiculo"))
-        cd_filial = to_str(row.get("cd_filial"))
-        cd_ccusto = to_str(row.get("cd_ccusto"))
-
-        if not placa or not cd_veiculo or not cd_filial or not cd_ccusto:
-            continue
-
-        existente = buscar_veiculo_db(db, placa)
-        if existente:
-            existente.placa = placa
-            existente.cd_veiculo = cd_veiculo
-            existente.cd_filial = cd_filial
-            existente.cd_ccusto = cd_ccusto
-            total_atualizado += 1
-        else:
-            db.add(VeiculoReferencia(placa=placa, cd_veiculo=cd_veiculo, cd_filial=cd_filial, cd_ccusto=cd_ccusto))
-            total_criado += 1
-        total_processado += 1
-
-    db.commit()
-    msg = f"Importacao concluida: {total_processado} processados, {total_criado} criados, {total_atualizado} atualizados"
-    return RedirectResponse(url=f"/painel/veiculos?msg={msg}", status_code=303)
-
-# =========================================================
-# ROTAS USUARIOS
-# =========================================================
-
-@app.post("/usuarios/login")
-async def login_usuario_app(request: Request, db: Session = Depends(get_db)):
-    try:
-        dados = await request.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail="JSON invalido")
-
-    matricula = to_str(dados.get("matricula"))
-    senha = to_str(dados.get("senha"))
-
-    usuario = db.query(UsuarioApp).filter(UsuarioApp.matricula == matricula).filter(UsuarioApp.senha == senha).first()
-    if not usuario:
-        raise HTTPException(status_code=401, detail="Matricula ou senha invalida")
-
-    return {
-        "ok": True,
-        "usuario": {
-            "id": usuario.id,
-            "matricula": usuario.matricula,
-            "cpf": usuario.cpf,
-            "nome_completo": usuario.nome_completo,
-            "funcao": usuario.funcao,
-        },
-    }
-
-
-@app.get("/usuarios")
-def listar_usuarios(busca: Optional[str] = Query(None), db: Session = Depends(get_db)):
-    query = db.query(UsuarioApp)
-    if busca:
-        query = query.filter(or_(UsuarioApp.matricula.ilike(f"%{busca}%"), UsuarioApp.nome_completo.ilike(f"%{busca}%")))
-    usuarios = query.order_by(UsuarioApp.nome_completo.asc()).all()
-    return [
-        {
-            "id": item.id,
-            "matricula": item.matricula,
-            "cpf": item.cpf,
-            "nome_completo": item.nome_completo,
-            "funcao": item.funcao,
-            "created_at": item.created_at.isoformat() if item.created_at else None,
-        }
-        for item in usuarios
-    ]
-
-
-@app.get("/painel/usuarios", response_class=HTMLResponse)
-def painel_usuarios(busca: Optional[str] = Query(None), msg: Optional[str] = Query(None), db: Session = Depends(get_db)):
-    query = db.query(UsuarioApp)
-    if busca:
-        query = query.filter(or_(UsuarioApp.matricula.ilike(f"%{busca}%"), UsuarioApp.nome_completo.ilike(f"%{busca}%")))
-    usuarios = query.order_by(UsuarioApp.nome_completo.asc()).all()
-    return HTMLResponse(content=render_usuarios_html(usuarios, busca or "", msg or ""))
-
-
-@app.post("/painel/usuarios/adicionar")
-async def adicionar_usuario(request: Request, db: Session = Depends(get_db)):
-    form = await request.form()
-    matricula = to_str(form.get("matricula"))
-    senha = to_str(form.get("senha"))
-    cpf = to_str(form.get("cpf"))
-    nome_completo = to_str(form.get("nome_completo"))
-    funcao_usuario = to_str(form.get("funcao"))
-
-    if not matricula or not senha or not nome_completo or not funcao_usuario:
-        raise HTTPException(status_code=400, detail="Matricula, senha, nome completo e funcao sao obrigatorios")
-
-    existente = db.query(UsuarioApp).filter(UsuarioApp.matricula == matricula).first()
-    if existente:
-        existente.senha = senha
-        existente.cpf = cpf
-        existente.nome_completo = nome_completo
-        existente.funcao = funcao_usuario
-        mensagem = "Usuario atualizado com sucesso"
-    else:
-        db.add(UsuarioApp(matricula=matricula, senha=senha, cpf=cpf, nome_completo=nome_completo, funcao=funcao_usuario))
-        mensagem = "Usuario cadastrado com sucesso"
-
-    db.commit()
-    return RedirectResponse(url=f"/painel/usuarios?msg={mensagem}", status_code=303)
-
-
-@app.post("/painel/usuarios/excluir/{usuario_id}")
-def excluir_usuario(usuario_id: int, db: Session = Depends(get_db)):
-    usuario = db.query(UsuarioApp).filter(UsuarioApp.id == usuario_id).first()
-    if usuario:
-        db.delete(usuario)
-        db.commit()
-    return RedirectResponse(url="/painel/usuarios?msg=Usuario excluido com sucesso", status_code=303)
-
-
-@app.post("/painel/usuarios/importar-xlsx")
-async def importar_usuarios_xlsx(arquivo: UploadFile = File(...), db: Session = Depends(get_db)):
-    if not arquivo.filename.lower().endswith(".xlsx"):
-        raise HTTPException(status_code=400, detail="Envie um arquivo .xlsx")
-
-    try:
-        df = pd.read_excel(BytesIO(await arquivo.read()))
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Erro ao ler XLSX: {str(e)}")
-
-    df.columns = [str(c).strip().lower() for c in df.columns]
-    colunas_obrigatorias = {"matricula", "senha", "nome_completo", "funcao"}
-    if not colunas_obrigatorias.issubset(set(df.columns)):
-        raise HTTPException(status_code=400, detail="O XLSX precisa ter as colunas: matricula, senha, nome_completo, funcao. A coluna cpf e opcional.")
-
-    total_processado = total_criado = total_atualizado = 0
-    for _, row in df.iterrows():
-        matricula = to_str(row.get("matricula"))
-        senha = to_str(row.get("senha"))
-        cpf = to_str(row.get("cpf"))
-        nome_completo = to_str(row.get("nome_completo"))
-        funcao_usuario = to_str(row.get("funcao"))
-
-        if not matricula or not senha or not nome_completo or not funcao_usuario:
-            continue
-
-        existente = db.query(UsuarioApp).filter(UsuarioApp.matricula == matricula).first()
-        if existente:
-            existente.senha = senha
-            existente.cpf = cpf
-            existente.nome_completo = nome_completo
-            existente.funcao = funcao_usuario
-            total_atualizado += 1
-        else:
-            db.add(UsuarioApp(matricula=matricula, senha=senha, cpf=cpf, nome_completo=nome_completo, funcao=funcao_usuario))
-            total_criado += 1
-        total_processado += 1
-
-    db.commit()
-    msg = f"Importacao concluida: {total_processado} processados, {total_criado} criados, {total_atualizado} atualizados"
-    return RedirectResponse(url=f"/painel/usuarios?msg={msg}", status_code=303)
-
-# =========================================================
-# ROTAS SERVICOS
-# =========================================================
-
-@app.get("/servicos")
-def listar_servicos(busca: Optional[str] = Query(None), db: Session = Depends(get_db)):
-    query = db.query(ServicoReferencia)
-
-    # Por padrao, nao retorna inativos quando bl_inativo = 1
-    query = query.filter(or_(ServicoReferencia.bl_inativo.is_(None), ServicoReferencia.bl_inativo != "1"))
-
-    if busca:
-        busca_like = f"%{busca}%"
-        query = query.filter(or_(
-            ServicoReferencia.cd_servico.ilike(busca_like),
-            ServicoReferencia.nm_servico.ilike(busca_like),
-            ServicoReferencia.nm_grpserv.ilike(busca_like),
-        ))
-
-    servicos = query.order_by(ServicoReferencia.nm_servico.asc()).all()
-    return [
-        {
-            "id": item.id,
-            "cd_grpserv": item.cd_grpserv,
-            "cd_servico": item.cd_servico,
-            "nm_servico": item.nm_servico,
-            "nome_servico": item.nm_servico,  # compatibilidade com Flutter anterior
-            "cd_empresa": item.cd_empresa,
-            "bl_inativo": item.bl_inativo,
-            "nm_grpserv": item.nm_grpserv,
-            "nm_empresa": item.nm_empresa,
-            "created_at": item.created_at.isoformat() if item.created_at else None,
-        }
-        for item in servicos
-    ]
-
-
-@app.get("/painel/servicos", response_class=HTMLResponse)
-def painel_servicos(busca: Optional[str] = Query(None), msg: Optional[str] = Query(None), db: Session = Depends(get_db)):
-    query = db.query(ServicoReferencia)
-    if busca:
-        busca_like = f"%{busca}%"
-        query = query.filter(or_(
-            ServicoReferencia.cd_servico.ilike(busca_like),
-            ServicoReferencia.nm_servico.ilike(busca_like),
-            ServicoReferencia.nm_grpserv.ilike(busca_like),
-        ))
-    servicos = query.order_by(ServicoReferencia.nm_servico.asc()).all()
-    return HTMLResponse(content=render_servicos_html(servicos, busca or "", msg or ""))
-
-
-@app.post("/painel/servicos/adicionar")
-async def adicionar_servico(request: Request, db: Session = Depends(get_db)):
-    form = await request.form()
-    cd_grpserv = to_str(form.get("cd_grpserv"))
-    cd_servico = to_str(form.get("cd_servico"))
-    nm_servico = to_str(form.get("nm_servico"))
-    cd_empresa = to_str(form.get("cd_empresa"))
-    bl_inativo = to_str(form.get("bl_inativo"))
-    nm_grpserv = to_str(form.get("nm_grpserv"))
-    nm_empresa = to_str(form.get("nm_empresa"))
-
-    if not cd_servico or not nm_servico:
-        raise HTTPException(status_code=400, detail="cd_servico e nm_servico sao obrigatorios")
-
-    existente = db.query(ServicoReferencia).filter(ServicoReferencia.cd_servico == cd_servico).first()
-    if existente:
-        existente.cd_grpserv = cd_grpserv
-        existente.nm_servico = nm_servico
-        existente.cd_empresa = cd_empresa
-        existente.bl_inativo = bl_inativo
-        existente.nm_grpserv = nm_grpserv
-        existente.nm_empresa = nm_empresa
-        mensagem = "Servico atualizado com sucesso"
-    else:
-        db.add(ServicoReferencia(
-            cd_grpserv=cd_grpserv,
-            cd_servico=cd_servico,
-            nm_servico=nm_servico,
-            cd_empresa=cd_empresa,
-            bl_inativo=bl_inativo,
-            nm_grpserv=nm_grpserv,
-            nm_empresa=nm_empresa,
-        ))
-        mensagem = "Servico cadastrado com sucesso"
-
-    db.commit()
-    return RedirectResponse(url=f"/painel/servicos?msg={mensagem}", status_code=303)
-
-
-@app.post("/painel/servicos/excluir/{servico_id}")
-def excluir_servico(servico_id: int, db: Session = Depends(get_db)):
-    servico = db.query(ServicoReferencia).filter(ServicoReferencia.id == servico_id).first()
-    if servico:
-        db.delete(servico)
-        db.commit()
-    return RedirectResponse(url="/painel/servicos?msg=Servico excluido com sucesso", status_code=303)
-
-
-@app.post("/painel/servicos/importar-xlsx")
-async def importar_servicos_xlsx(arquivo: UploadFile = File(...), db: Session = Depends(get_db)):
-    if not arquivo.filename.lower().endswith(".xlsx"):
-        raise HTTPException(status_code=400, detail="Envie um arquivo .xlsx")
-
-    try:
-        df = pd.read_excel(BytesIO(await arquivo.read()))
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Erro ao ler XLSX: {str(e)}")
-
-    df.columns = [str(c).strip().lower() for c in df.columns]
-    colunas_obrigatorias = {"cd_grpserv", "cd_servico", "nm_servico", "cd_empresa", "bl_inativo", "nm_grpserv", "nm_empresa"}
-    if not colunas_obrigatorias.issubset(set(df.columns)):
-        raise HTTPException(
-            status_code=400,
-            detail="O XLSX precisa ter as colunas: cd_grpserv, cd_servico, nm_servico, cd_empresa, bl_inativo, nm_grpserv, nm_empresa",
-        )
-
-    total_processado = total_criado = total_atualizado = 0
-
-    for _, row in df.iterrows():
-        cd_grpserv = to_str(row.get("cd_grpserv"))
-        cd_servico = to_str(row.get("cd_servico"))
-        nm_servico = to_str(row.get("nm_servico"))
-        cd_empresa = to_str(row.get("cd_empresa"))
-        bl_inativo = to_str(row.get("bl_inativo"))
-        nm_grpserv = to_str(row.get("nm_grpserv"))
-        nm_empresa = to_str(row.get("nm_empresa"))
-
-        if not cd_servico or not nm_servico:
-            continue
-
-        existente = db.query(ServicoReferencia).filter(ServicoReferencia.cd_servico == cd_servico).first()
-        if existente:
-            existente.cd_grpserv = cd_grpserv
-            existente.nm_servico = nm_servico
-            existente.cd_empresa = cd_empresa
-            existente.bl_inativo = bl_inativo
-            existente.nm_grpserv = nm_grpserv
-            existente.nm_empresa = nm_empresa
-            total_atualizado += 1
-        else:
-            db.add(ServicoReferencia(
-                cd_grpserv=cd_grpserv,
-                cd_servico=cd_servico,
-                nm_servico=nm_servico,
-                cd_empresa=cd_empresa,
-                bl_inativo=bl_inativo,
-                nm_grpserv=nm_grpserv,
-                nm_empresa=nm_empresa,
-            ))
-            total_criado += 1
-
-        total_processado += 1
-
-    db.commit()
-    msg = f"Importacao concluida: {total_processado} processados, {total_criado} criados, {total_atualizado} atualizados"
-    return RedirectResponse(url=f"/painel/servicos?msg={msg}", status_code=303)
+    return {"ok": True, "message": f"O.S. {ordem_id} removida do painel"}
