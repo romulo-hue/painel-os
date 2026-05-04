@@ -6,7 +6,7 @@ import pandas as pd
 import requests
 from fastapi import FastAPI, Depends, Query, Request, HTTPException, UploadFile, File
 from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse, RedirectResponse
-from sqlalchemy import create_engine, Column, Integer, String, DateTime, Text, func, or_
+from sqlalchemy import create_engine, Column, Integer, String, DateTime, Text, func, or_, text
 from sqlalchemy.orm import sessionmaker, declarative_base, Session
 
 # =========================================================
@@ -64,6 +64,9 @@ class OrdemServico(Base):
     cd_servico = Column(String(100), nullable=True)
     cd_servicos = Column(Text, nullable=True)
     try_out = Column(String(255), nullable=True)
+    status_envio = Column(String(50), nullable=False, default="PENDENTE")
+    retorno_envio = Column(Text, nullable=True)
+    senha_frotaweb = Column(String(255), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
     deleted_at = Column(DateTime(timezone=True), nullable=True)
@@ -111,6 +114,17 @@ class ServicoReferencia(Base):
 
 Base.metadata.create_all(bind=engine)
 
+def garantir_colunas_envio():
+    """Garante colunas novas em bancos ja existentes no Render."""
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE ordens_servico ADD COLUMN IF NOT EXISTS status_envio VARCHAR(50) DEFAULT 'PENDENTE'"))
+        conn.execute(text("ALTER TABLE ordens_servico ADD COLUMN IF NOT EXISTS retorno_envio TEXT"))
+        conn.execute(text("ALTER TABLE ordens_servico ADD COLUMN IF NOT EXISTS senha_frotaweb VARCHAR(255)"))
+        conn.execute(text("UPDATE ordens_servico SET status_envio = 'PENDENTE' WHERE status_envio IS NULL"))
+
+garantir_colunas_envio()
+
+
 # =========================================================
 # HELPERS
 # =========================================================
@@ -137,28 +151,105 @@ def normalize_cd_servicos(value):
     return [valor] if valor else []
 
 
+
 def montar_payload(dados: dict) -> dict:
+    """
+    Aceita tanto o JSON do painel quanto o JSON vindo do app Android.
+    O app antigo envia campos como vehicle_code, plate, opening_datetime, odometer.
+    A integracao FrotaWeb espera campos como cd_veiculo, placa, dh_entrada, km_entrada.
+    """
+    credenciais = dados.get("credenciais") or dados.get("credentials") or {}
+    if not isinstance(credenciais, dict):
+        credenciais = {}
+
+    def pick(*nomes, default=""):
+        for nome in nomes:
+            if "." in nome:
+                grupo, chave = nome.split(".", 1)
+                origem = dados.get(grupo) or {}
+                if isinstance(origem, dict):
+                    valor = origem.get(chave)
+                else:
+                    valor = None
+            else:
+                valor = dados.get(nome)
+            texto = to_str(valor)
+            if texto:
+                return texto
+        return default
+
+    usuario = pick("usuario", "credenciais.usuario", "credentials.usuario")
+    senha = pick("senha", "credenciais.senha", "credentials.senha")
+    filial_login = pick("filial_login", "credenciais.filial", "credentials.filial", "branch_code")
+    cd_empresa = pick("cd_empresa", "empresa", "credenciais.empresa", "credentials.empresa", default="1")
+
+    cd_veiculo = pick("cd_veiculo", "codigo_veiculo", "vehicle_code")
+    placa = pick("placa", "plate").upper()
+    dh_entrada = pick("dh_entrada", "data_hora_abertura", "opening_datetime")
+    dh_saida = pick("dh_saida", "data_hora_saida", "exit_datetime")
+    km_entrada = pick("km_entrada", "hodometro", "odometer")
+    km_saida = pick("km_saida", "hodometro_saida", "exit_odometer", "odometer")
+    dh_inicio = pick("dh_inicio", "data_hora_inicio", "start_datetime", "opening_datetime")
+    dh_prev = pick("dh_prev", "data_hora_previsao_liberacao", "expected_release_datetime", "exit_datetime")
+    cd_filial = pick("cd_filial", "codigo_filial", "branch_code", "filial")
+    cd_ccusto = pick("cd_ccusto", "codigo_departamento", "department_code")
+    cd_servico = pick("cd_servico", "codigo_servico", "service_code")
+
+    observacao = pick("observacao", "observacoes", "observations")
+    defeito = pick("descricao_defeito", "defect_description")
+    if defeito:
+        observacao = (observacao + " | " if observacao else "") + defeito
+
+    cd_servicos = dados.get("cd_servicos")
+    if cd_servicos is None:
+        cd_servicos = dados.get("codigo_servicos")
+    if cd_servicos is None and cd_servico:
+        cd_servicos = [cd_servico]
+
     return {
-        "usuario": to_str(dados.get("usuario")),
-        "senha": to_str(dados.get("senha")),
-        "filial_login": to_str(dados.get("filial_login")),
-        "cd_empresa": to_str(dados.get("cd_empresa")),
-        "cd_veiculo": to_str(dados.get("cd_veiculo")),
-        "placa": to_str(dados.get("placa")).upper(),
-        "dh_entrada": to_str(dados.get("dh_entrada")),
-        "km_entrada": to_str(dados.get("km_entrada")),
-        "dh_saida": to_str(dados.get("dh_saida")),
-        "km_saida": to_str(dados.get("km_saida")),
-        "dh_inicio": to_str(dados.get("dh_inicio")),
-        "dh_prev": to_str(dados.get("dh_prev")),
-        "cd_filial": to_str(dados.get("cd_filial")),
-        "cd_ccusto": to_str(dados.get("cd_ccusto")),
-        "observacao": to_str(dados.get("observacao")),
-        "cd_servico": to_str(dados.get("cd_servico")),
-        "cd_servicos": normalize_cd_servicos(dados.get("cd_servicos")),
-        "try_out": to_str(dados.get("try_out")),
+        "usuario": usuario,
+        "senha": senha,
+        "filial_login": filial_login,
+        "cd_empresa": cd_empresa,
+        "cd_veiculo": cd_veiculo,
+        "placa": placa,
+        "dh_entrada": dh_entrada,
+        "km_entrada": km_entrada,
+        "dh_saida": dh_saida,
+        "km_saida": km_saida,
+        "dh_inicio": dh_inicio,
+        "dh_prev": dh_prev,
+        "cd_filial": cd_filial,
+        "cd_ccusto": cd_ccusto,
+        "observacao": observacao,
+        "cd_servico": cd_servico,
+        "cd_servicos": normalize_cd_servicos(cd_servicos),
+        "try_out": pick("try_out", default="PENDENTE_PAINEL"),
     }
 
+
+
+def montar_payload_da_ordem(ordem: OrdemServico) -> dict:
+    return {
+        "usuario": to_str(ordem.usuario),
+        "senha": to_str(ordem.senha_frotaweb),
+        "filial_login": to_str(ordem.filial_login),
+        "cd_empresa": to_str(ordem.cd_empresa),
+        "cd_veiculo": to_str(ordem.cd_veiculo),
+        "placa": to_str(ordem.placa).upper(),
+        "dh_entrada": to_str(ordem.dh_entrada),
+        "km_entrada": to_str(ordem.km_entrada),
+        "dh_saida": to_str(ordem.dh_saida),
+        "km_saida": to_str(ordem.km_saida),
+        "dh_inicio": to_str(ordem.dh_inicio),
+        "dh_prev": to_str(ordem.dh_prev),
+        "cd_filial": to_str(ordem.cd_filial),
+        "cd_ccusto": to_str(ordem.cd_ccusto),
+        "observacao": to_str(ordem.observacao),
+        "cd_servico": to_str(ordem.cd_servico),
+        "cd_servicos": ordem.cd_servicos.split(",") if ordem.cd_servicos else [],
+        "try_out": to_str(ordem.try_out),
+    }
 
 def enviar_para_outra_api(payload: dict):
     payload_api = dict(payload)
@@ -258,9 +349,24 @@ def render_base_html(titulo: str, corpo: str, mensagem: str = ""):
 # HTML ORDENS
 # =========================================================
 
-def render_ordens_html(ordens, filtros):
+
+def render_ordens_html(ordens, filtros, mensagem: str = ""):
     linhas = ""
     for item in ordens:
+        status = item.status_envio or "PENDENTE"
+        retorno_curto = (item.retorno_envio or "")
+        if len(retorno_curto) > 180:
+            retorno_curto = retorno_curto[:180] + "..."
+
+        if status == "ENVIADA":
+            acao = "<span style='color:#059669;font-weight:bold;'>Enviada</span>"
+        else:
+            acao = f"""
+            <form method="post" action="/painel/ordens-servico/enviar/{item.id}" onsubmit="return confirm('Enviar esta O.S. para o FrotaWeb agora?')">
+                <button class="btn-green" type="submit">Enviar FrotaWeb</button>
+            </form>
+            """
+
         linhas += f"""
         <tr>
             <td>{item.id}</td>
@@ -269,9 +375,12 @@ def render_ordens_html(ordens, filtros):
             <td>{item.cd_veiculo or ""}</td>
             <td>{item.cd_filial or ""}</td>
             <td>{item.cd_servico or ""}</td>
+            <td><b>{status}</b></td>
             <td>{item.try_out or ""}</td>
             <td>{item.observacao or ""}</td>
+            <td>{retorno_curto}</td>
             <td>{item.created_at.strftime("%d/%m/%Y %H:%M") if item.created_at else ""}</td>
+            <td>{acao}</td>
         </tr>
         """
 
@@ -282,6 +391,9 @@ def render_ordens_html(ordens, filtros):
             <a class="btn btn-dark" href="/painel/usuarios">Cadastro de Usuarios</a>
             <a class="btn btn-purple" href="/painel/servicos">Cadastro de Servicos</a>
         </div>
+        <p class="hint">
+            Fluxo: o app salva a O.S. aqui no painel como <b>PENDENTE</b>. Depois de conferir, clique em <b>Enviar FrotaWeb</b>.
+        </p>
     </div>
 
     <div class="card">
@@ -296,6 +408,7 @@ def render_ordens_html(ordens, filtros):
                 <button type="submit">Filtrar</button>
                 <a class="btn btn-green" href="/painel/ordens-servico/exportar/xlsx?usuario={filtros.get("usuario", "")}&placa={filtros.get("placa", "")}&cd_veiculo={filtros.get("cd_veiculo", "")}&try_out={filtros.get("try_out", "")}">Exportar XLSX</a>
                 <a class="btn btn-purple" href="/painel/ordens-servico/exportar/json?usuario={filtros.get("usuario", "")}&placa={filtros.get("placa", "")}&cd_veiculo={filtros.get("cd_veiculo", "")}&try_out={filtros.get("try_out", "")}">Exportar JSON</a>
+                <a class="btn btn-gray" href="/painel/ordens-servico">Limpar</a>
             </div>
         </form>
     </div>
@@ -304,14 +417,14 @@ def render_ordens_html(ordens, filtros):
         <table>
             <thead>
                 <tr>
-                    <th>ID</th><th>Usuario</th><th>Placa</th><th>CD Veiculo</th><th>CD Filial</th><th>CD Servico</th><th>Try Out</th><th>Observacao</th><th>Criado em</th>
+                    <th>ID</th><th>Usuario</th><th>Placa</th><th>CD Veiculo</th><th>CD Filial</th><th>CD Servico</th><th>Status</th><th>Try Out</th><th>Observacao</th><th>Retorno</th><th>Criado em</th><th>Acao</th>
                 </tr>
             </thead>
-            <tbody>{linhas if linhas else '<tr><td colspan="9">Nenhum registro encontrado</td></tr>'}</tbody>
+            <tbody>{linhas if linhas else '<tr><td colspan="12">Nenhum registro encontrado</td></tr>'}</tbody>
         </table>
     </div>
     """
-    return render_base_html("Painel de Ordens de Servico", corpo)
+    return render_base_html("Painel de Ordens de Servico", corpo, mensagem)
 
 # =========================================================
 # HTML VEICULOS
@@ -565,15 +678,20 @@ def health():
 # ROTAS ORDENS
 # =========================================================
 
+
 @app.post("/ordens-servico")
 async def criar_ordem_servico(request: Request, db: Session = Depends(get_db)):
+    """
+    Salva a O.S. no painel para conferencia.
+    Nao envia automaticamente para o FrotaWeb.
+    O envio ao FrotaWeb e feito depois pelo botao no painel.
+    """
     try:
         dados = await request.json()
     except Exception:
         raise HTTPException(status_code=400, detail="JSON invalido")
 
     payload = montar_payload(dados)
-    retorno_integracao = enviar_para_outra_api(payload)
 
     nova = OrdemServico(
         usuario=payload["usuario"],
@@ -593,6 +711,9 @@ async def criar_ordem_servico(request: Request, db: Session = Depends(get_db)):
         cd_servico=payload["cd_servico"],
         cd_servicos=",".join(payload["cd_servicos"]),
         try_out=payload["try_out"],
+        status_envio="PENDENTE",
+        retorno_envio="Salva no painel. Aguardando conferencia e envio manual ao FrotaWeb.",
+        senha_frotaweb=payload["senha"],
     )
 
     db.add(nova)
@@ -601,10 +722,74 @@ async def criar_ordem_servico(request: Request, db: Session = Depends(get_db)):
 
     return {
         "ok": True,
+        "created": True,
+        "accepted": True,
         "id": nova.id,
-        "message": "Ordem de servico criada com sucesso e enviada para a outra API",
+        "panel_id": str(nova.id),
+        "order_number": str(nova.id),
+        "status_envio": nova.status_envio,
+        "message": "O.S. salva no painel para conferencia. Nao foi enviada ao FrotaWeb.",
+        "payload_recebido": payload,
+    }
+
+
+@app.post("/panel/os")
+async def criar_ordem_servico_app_alias(request: Request, db: Session = Depends(get_db)):
+    """
+    Alias para o app Android.
+    Permite o app chamar /panel/os e salvar no mesmo painel.
+    """
+    return await criar_ordem_servico(request=request, db=db)
+
+
+@app.post("/painel/ordens-servico/enviar/{ordem_id}")
+def enviar_ordem_pendente_para_frotaweb(ordem_id: int, db: Session = Depends(get_db)):
+    ordem = db.query(OrdemServico).filter(OrdemServico.id == ordem_id).filter(OrdemServico.deleted_at.is_(None)).first()
+    if not ordem:
+        raise HTTPException(status_code=404, detail="O.S. nao encontrada")
+
+    payload = montar_payload_da_ordem(ordem)
+
+    try:
+        retorno = enviar_para_outra_api(payload)
+    except HTTPException as exc:
+        ordem.status_envio = "ERRO_ENVIO"
+        ordem.retorno_envio = str(exc.detail)
+        db.commit()
+        return RedirectResponse(
+            url=f"/painel/ordens-servico?msg=Erro ao enviar O.S. {ordem.id} ao FrotaWeb",
+            status_code=303,
+        )
+
+    ordem.status_envio = "ENVIADA"
+    ordem.retorno_envio = str(retorno)
+    db.commit()
+
+    return RedirectResponse(
+        url=f"/painel/ordens-servico?msg=O.S. {ordem.id} enviada ao FrotaWeb com sucesso",
+        status_code=303,
+    )
+
+
+@app.post("/ordens-servico/{ordem_id}/enviar-frotaweb")
+def enviar_ordem_pendente_para_frotaweb_json(ordem_id: int, db: Session = Depends(get_db)):
+    ordem = db.query(OrdemServico).filter(OrdemServico.id == ordem_id).filter(OrdemServico.deleted_at.is_(None)).first()
+    if not ordem:
+        raise HTTPException(status_code=404, detail="O.S. nao encontrada")
+
+    payload = montar_payload_da_ordem(ordem)
+    retorno = enviar_para_outra_api(payload)
+
+    ordem.status_envio = "ENVIADA"
+    ordem.retorno_envio = str(retorno)
+    db.commit()
+
+    return {
+        "ok": True,
+        "id": ordem.id,
+        "status_envio": ordem.status_envio,
         "payload_enviado": payload,
-        "retorno_integracao": retorno_integracao,
+        "retorno_integracao": retorno,
     }
 
 
@@ -640,6 +825,8 @@ def listar_ordens_servico(
             "cd_servico": item.cd_servico,
             "cd_servicos": item.cd_servicos.split(",") if item.cd_servicos else [],
             "try_out": item.try_out,
+            "status_envio": item.status_envio,
+            "retorno_envio": item.retorno_envio,
             "created_at": item.created_at.isoformat() if item.created_at else None,
             "updated_at": item.updated_at.isoformat() if item.updated_at else None,
         }
@@ -653,6 +840,7 @@ def painel_ordens_servico(
     placa: Optional[str] = Query(None),
     cd_veiculo: Optional[str] = Query(None),
     try_out: Optional[str] = Query(None),
+    msg: Optional[str] = Query(None),
     db: Session = Depends(get_db),
 ):
     query = db.query(OrdemServico)
@@ -666,7 +854,7 @@ def painel_ordens_servico(
         "try_out": try_out or "",
     }
 
-    return HTMLResponse(content=render_ordens_html(ordens, filtros))
+    return HTMLResponse(content=render_ordens_html(ordens, filtros, msg or ""))
 
 
 @app.get("/painel/ordens-servico/exportar/xlsx")
@@ -702,6 +890,8 @@ def exportar_ordens_xlsx(
             "CD Servico": item.cd_servico,
             "CD Servicos": item.cd_servicos,
             "Try Out": item.try_out,
+            "Status Envio": item.status_envio,
+            "Retorno Envio": item.retorno_envio,
             "Criado em": item.created_at.strftime("%d/%m/%Y %H:%M") if item.created_at else "",
         })
 
@@ -749,6 +939,8 @@ def exportar_ordens_json(
             "cd_servico": item.cd_servico,
             "cd_servicos": item.cd_servicos.split(",") if item.cd_servicos else [],
             "try_out": item.try_out,
+            "status_envio": item.status_envio,
+            "retorno_envio": item.retorno_envio,
             "created_at": item.created_at.isoformat() if item.created_at else None,
             "updated_at": item.updated_at.isoformat() if item.updated_at else None,
         }
