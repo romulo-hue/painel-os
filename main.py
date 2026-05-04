@@ -1,10 +1,12 @@
 import os
 import json
+import base64
 from typing import Any, Generator, Optional
 
 import requests
 from fastapi import FastAPI, Depends, Request, HTTPException, Query
 from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, Text, Boolean, func, text
 from sqlalchemy.orm import sessionmaker, declarative_base, Session
 
@@ -47,6 +49,10 @@ app = FastAPI(
     version="4.0.0",
     description="Recebe O.S. e serviços do app, salva no painel e envia manualmente ao FrotaWeb nos formatos de tryout.",
 )
+
+UPLOAD_DIR = os.getenv("UPLOAD_DIR", "uploads/fotos")
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+app.mount("/fotos", StaticFiles(directory=UPLOAD_DIR), name="fotos")
 
 # =========================================================
 # DATABASE
@@ -111,6 +117,10 @@ class OrdemServico(Base):
     retorno_envio = Column(Text, nullable=True)
     payload_original = Column(Text, nullable=True)
     campos_brutos = Column(Text, nullable=True)
+
+    # Fotos e JSON original recebidos do aplicativo
+    fotos_app = Column(Text, nullable=True)
+    app_payload = Column(Text, nullable=True)
 
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
@@ -195,6 +205,8 @@ def garantir_colunas():
             "retorno_envio": "TEXT",
             "payload_original": "TEXT",
             "campos_brutos": "TEXT",
+            "fotos_app": "TEXT",
+            "app_payload": "TEXT",
             "created_at": "TIMESTAMP WITH TIME ZONE DEFAULT now()",
             "updated_at": "TIMESTAMP WITH TIME ZONE DEFAULT now()",
             "deleted_at": "TIMESTAMP WITH TIME ZONE",
@@ -595,6 +607,205 @@ def status_class(status: str) -> str:
         return "status-erro"
     return "status-pendente"
 
+
+def json_dumps_safe(value: Any) -> str:
+    try:
+        return json.dumps(value, ensure_ascii=False)
+    except Exception:
+        return str(value)
+
+
+def json_loads_safe(value: str, default: Any = None) -> Any:
+    try:
+        return json.loads(value or "")
+    except Exception:
+        return default
+
+
+def limpar_base64(data_base64: str) -> str:
+    texto = str(data_base64 or "").strip()
+    if "," in texto and texto.lower().startswith("data:"):
+        return texto.split(",", 1)[1]
+    return texto
+
+
+def salvar_fotos_app(dados: dict) -> list[str]:
+    fotos = dados.get("photos") or dados.get("fotos") or dados.get("imagens") or []
+    if not isinstance(fotos, list):
+        return []
+
+    caminhos: list[str] = []
+    for idx, foto in enumerate(fotos, start=1):
+        if not isinstance(foto, dict):
+            continue
+
+        data_base64 = foto.get("data_base64") or foto.get("base64") or foto.get("data")
+        if not data_base64:
+            continue
+
+        try:
+            raw = base64.b64decode(limpar_base64(str(data_base64)), validate=False)
+        except Exception:
+            continue
+
+        filename = str(foto.get("filename") or foto.get("nome") or f"foto_os_{idx}.jpg")
+        ext = os.path.splitext(filename)[-1].lower()
+        if ext not in (".jpg", ".jpeg", ".png", ".webp"):
+            ext = ".jpg"
+
+        nome_arquivo = f"os_{int(datetime.now().timestamp() * 1000)}_{idx}{ext}"
+        destino = os.path.join(UPLOAD_DIR, nome_arquivo)
+        with open(destino, "wb") as f:
+            f.write(raw)
+
+        caminhos.append(f"/fotos/{nome_arquivo}")
+
+    return caminhos
+
+
+def fotos_da_ordem(ordem: OrdemServico) -> list[str]:
+    fotos = json_loads_safe(ordem.fotos_app or "", [])
+    if isinstance(fotos, list):
+        return [str(foto) for foto in fotos if str(foto).strip()]
+    return []
+
+
+def html_fotos_ordem(ordem: OrdemServico) -> str:
+    fotos = fotos_da_ordem(ordem)
+    if not fotos:
+        return "<span class='small'>Sem foto</span>"
+
+    partes = []
+    for idx, foto in enumerate(fotos, start=1):
+        foto_esc = escape_html(foto)
+        partes.append(
+            f"<a href='{foto_esc}' target='_blank' title='Foto {idx}'>"
+            f"<img src='{foto_esc}' class='foto-thumb' alt='Foto {idx}'>"
+            f"</a>"
+        )
+
+    return "<div class='foto-grid'>" + "".join(partes) + "</div>"
+
+
+def payload_original_dict(ordem: OrdemServico) -> dict:
+    payload = json_loads_safe(ordem.app_payload or "", None)
+    if isinstance(payload, dict):
+        return payload
+
+    payload = json_loads_safe(ordem.payload_original or "", None)
+    if isinstance(payload, dict):
+        return payload
+
+    return {}
+
+
+def contem(valor: Any, filtro: Any) -> bool:
+    texto_filtro = str(filtro or "").strip().lower()
+    if not texto_filtro:
+        return True
+    return texto_filtro in str(valor or "").lower()
+
+
+def filtrar_ordens(ordens: list[OrdemServico], filtros: dict) -> list[OrdemServico]:
+    filtradas = []
+    for o in ordens:
+        servicos_txt = filtros.get("_servicos_texto", {}).get(o.id, "")
+        if not contem(o.id, filtros.get("id")):
+            continue
+        if not contem(o.status_envio, filtros.get("status_envio")):
+            continue
+        if not contem(o.numero_os, filtros.get("numero_os")):
+            continue
+        if not contem(servicos_txt, filtros.get("servicos")):
+            continue
+        if not contem(o.codigo_veiculo, filtros.get("codigo_veiculo")):
+            continue
+        if not contem(o.placa, filtros.get("placa")):
+            continue
+        if not contem(o.hodometro, filtros.get("hodometro")):
+            continue
+        if not contem(o.data_hora_abertura, filtros.get("data_hora_abertura")):
+            continue
+        if not contem(o.data_hora_saida, filtros.get("data_hora_saida")):
+            continue
+        if not contem(o.codigo_filial, filtros.get("codigo_filial")):
+            continue
+        if not contem(o.codigo_departamento, filtros.get("codigo_departamento")):
+            continue
+        if not contem(o.descricao_defeito, filtros.get("descricao_defeito")):
+            continue
+        if not contem(o.retorno_envio, filtros.get("retorno_envio")):
+            continue
+        if not contem(o.created_at.strftime("%d/%m/%Y %H:%M") if o.created_at else "", filtros.get("created_at")):
+            continue
+        if filtros.get("fotos") and not fotos_da_ordem(o):
+            continue
+        filtradas.append(o)
+    return filtradas
+
+
+def ordem_edit_fields() -> list[tuple[str, str, str]]:
+    return [
+        ("empresa", "Empresa", "text"),
+        ("usuario", "Usuário", "text"),
+        ("senha", "Senha", "password"),
+        ("filial", "Filial login", "text"),
+        ("recurso_humano", "Recurso humano", "text"),
+        ("codigo_veiculo", "Código veículo", "text"),
+        ("descricao_defeito", "Descrição defeito", "textarea"),
+        ("numero_os", "Nº O.S. FrotaWeb", "text"),
+        ("placa", "Placa", "text"),
+        ("codigo_componente", "Código componente", "text"),
+        ("data_abertura", "Data abertura", "text"),
+        ("data_hora_abertura", "Data/hora abertura", "text"),
+        ("hodometro", "Hodômetro entrada", "text"),
+        ("horimetro_entrada", "Horímetro entrada", "text"),
+        ("data_hora_saida", "Data/hora saída", "text"),
+        ("hodometro_saida", "Hodômetro saída", "text"),
+        ("horimetro_saida", "Horímetro saída", "text"),
+        ("data_hora_inicio", "Data/hora início", "text"),
+        ("data_hora_previsao_liberacao", "Previsão liberação", "text"),
+        ("horas_previstas", "Horas previstas", "text"),
+        ("horas_realizadas", "Horas realizadas", "text"),
+        ("codigo_filial", "Código filial", "text"),
+        ("codigo_departamento", "Código departamento", "text"),
+        ("codigo_oficina", "Código oficina", "text"),
+        ("codigo_servico", "Código serviço", "text"),
+        ("codigo_solicitante", "Código solicitante", "text"),
+        ("codigo_motorista", "Código motorista", "text"),
+        ("numero_ocorrencia", "Número ocorrência", "text"),
+        ("numero_contrato", "Número contrato", "text"),
+        ("valor_acrescimo", "Valor acréscimo", "text"),
+        ("numero_os_retorno", "Nº O.S. retorno", "text"),
+        ("observacoes", "Observações", "textarea"),
+    ]
+
+
+def render_edit_form_field(ordem: OrdemServico, field_name: str, label: str, field_type: str) -> str:
+    value = getattr(ordem, field_name, "") or ""
+    if field_type == "textarea":
+        return f"""
+        <label>{escape_html(label)}
+          <textarea name="{field_name}">{escape_html(value)}</textarea>
+        </label>
+        """
+    return f"""
+    <label>{escape_html(label)}
+      <input type="{field_type}" name="{field_name}" value="{escape_html(value)}">
+    </label>
+    """
+
+
+def render_checkbox(name: str, label: str, checked: bool) -> str:
+    marcado = "checked" if checked else ""
+    return f"""
+    <label class="check-line">
+      <input type="checkbox" name="{name}" value="true" {marcado}>
+      {escape_html(label)}
+    </label>
+    """
+
+
 # =========================================================
 # HTML
 # =========================================================
@@ -638,15 +849,36 @@ def html_base(titulo: str, corpo: str, msg: str = "") -> str:
     """
 
 
-def render_painel(ordens, servicos, filtro_status: str = "", msg: str = "") -> str:
+def render_painel(ordens, servicos, filtros: Optional[dict] = None, msg: str = "") -> str:
+    filtros = filtros or {}
+
+    servicos_por_ordem = {}
+    for ordem in ordens:
+        relacionados = [
+            s for s in servicos
+            if str(s.numero_os or "") in (str(ordem.id), str(ordem.numero_os or ""))
+            or (
+                ordem.codigo_veiculo and s.codigo_veiculo and str(s.codigo_veiculo).strip() == str(ordem.codigo_veiculo).strip()
+                and ordem.placa and s.placa and str(s.placa).strip().upper() == str(ordem.placa).strip().upper()
+            )
+        ]
+        servicos_por_ordem[ordem.id] = relacionados
+
+    filtros["_servicos_texto"] = {
+        ordem_id: " ".join([str(s.codigo_servico or "") for s in lista])
+        for ordem_id, lista in servicos_por_ordem.items()
+    }
+
+    ordens_filtradas = filtrar_ordens(ordens, filtros)
+
     linhas_os = ""
-    for o in ordens:
+    for o in ordens_filtradas:
         st = o.status_envio or "PENDENTE"
         ret = (o.retorno_envio or "")
         if len(ret) > 220:
             ret = ret[:220] + "..."
 
-        serv_rel = [s for s in servicos if str(s.numero_os or "") in (str(o.id), str(o.numero_os or ""))]
+        serv_rel = servicos_por_ordem.get(o.id, [])
         total_serv = len(serv_rel)
         enviados_serv = len([s for s in serv_rel if s.status_envio == "ENVIADA"])
         erros_serv = len([s for s in serv_rel if str(s.status_envio or "").startswith("ERRO")])
@@ -658,21 +890,41 @@ def render_painel(ordens, servicos, filtro_status: str = "", msg: str = "") -> s
         if pend_serv:
             servico_resumo += f" | {pend_serv} pendente(s)"
 
+        acoes = f"""
+        <div class="acoes">
+          <a class="btn btn-blue" href="/painel/ordens-servico/editar/{o.id}">Editar</a>
+          <form method="post" action="/painel/ordens-servico/deletar/{o.id}" onsubmit="return confirm('Deletar a O.S. {o.id}? Esta ação remove a O.S. do painel.');">
+            <button class="btn-red" type="submit">Deletar</button>
+          </form>
+        """
         if st == "ENVIADA":
-            acao = "<span class='status-enviada'>O.S. enviada</span>"
+            acoes += "<span class='status-enviada'>O.S. enviada</span>"
         else:
-            acao = f"""
+            acoes += f"""
             <form method="post" action="/painel/ordens-servico/enviar/{o.id}" onsubmit="return confirm('Enviar O.S. {o.id} ao FrotaWeb?')">
               <button class="btn-green" type="submit">Enviar O.S. + Serviços</button>
             </form>
             """
+        acoes += "</div>"
+
         linhas_os += f"""
         <tr>
-          <td>{o.id}</td><td><span class="{status_class(st)}">{st}</span></td><td>{o.numero_os or ""}</td><td>{servico_resumo}</td>
-          <td>{o.codigo_veiculo or ""}</td><td>{o.placa or ""}</td>
-          <td>{o.hodometro or ""}</td><td>{o.data_hora_abertura or ""}</td><td>{o.data_hora_saida or ""}</td>
-          <td>{o.codigo_filial or ""}</td><td>{o.codigo_departamento or ""}</td><td>{o.descricao_defeito or ""}</td>
-          <td class="retorno">{ret}</td><td>{o.created_at.strftime("%d/%m/%Y %H:%M") if o.created_at else ""}</td><td>{acao}</td>
+          <td>{o.id}</td>
+          <td><span class="{status_class(st)}">{st}</span></td>
+          <td>{escape_html(o.numero_os or "")}</td>
+          <td>{escape_html(servico_resumo)}</td>
+          <td>{escape_html(o.codigo_veiculo or "")}</td>
+          <td>{escape_html(o.placa or "")}</td>
+          <td>{escape_html(o.hodometro or "")}</td>
+          <td>{escape_html(o.data_hora_abertura or "")}</td>
+          <td>{escape_html(o.data_hora_saida or "")}</td>
+          <td>{escape_html(o.codigo_filial or "")}</td>
+          <td>{escape_html(o.codigo_departamento or "")}</td>
+          <td>{escape_html(o.descricao_defeito or "")}</td>
+          <td>{html_fotos_ordem(o)}</td>
+          <td class="retorno">{escape_html(ret)}</td>
+          <td>{o.created_at.strftime("%d/%m/%Y %H:%M") if o.created_at else ""}</td>
+          <td>{acoes}</td>
         </tr>
         """
 
@@ -692,33 +944,54 @@ def render_painel(ordens, servicos, filtro_status: str = "", msg: str = "") -> s
             """
         linhas_serv += f"""
         <tr>
-          <td>{s.id}</td><td><span class="{status_class(st)}">{st}</span></td><td>{s.numero_os or ""}</td><td>{s.codigo_veiculo or ""}</td><td>{s.placa or ""}</td>
-          <td>{s.codigo_servico or ""}</td><td>{s.codigo_recurso_humano or ""}</td><td>{s.tempo_gasto or ""}</td><td>{s.valor_hora or ""}</td>
-          <td class="retorno">{ret}</td><td>{s.created_at.strftime("%d/%m/%Y %H:%M") if s.created_at else ""}</td><td>{acao}</td>
+          <td>{s.id}</td><td><span class="{status_class(st)}">{st}</span></td><td>{escape_html(s.numero_os or "")}</td><td>{escape_html(s.codigo_veiculo or "")}</td><td>{escape_html(s.placa or "")}</td>
+          <td>{escape_html(s.codigo_servico or "")}</td><td>{escape_html(s.codigo_recurso_humano or "")}</td><td>{escape_html(s.tempo_gasto or "")}</td><td>{escape_html(s.valor_hora or "")}</td>
+          <td class="retorno">{escape_html(ret)}</td><td>{s.created_at.strftime("%d/%m/%Y %H:%M") if s.created_at else ""}</td><td>{acao}</td>
         </tr>
         """
+
+    def fv(nome: str) -> str:
+        return escape_html(filtros.get(nome, "") or "")
 
     corpo = f"""
     <div class="card">
       <form method="get" action="/painel/ordens-servico">
-        <div class="grid">
-          <div>
-            <label>Status</label>
-            <select name="status_envio">
-              <option value="" {"selected" if not filtro_status else ""}>Todos</option>
-              <option value="PENDENTE" {"selected" if filtro_status == "PENDENTE" else ""}>Pendente</option>
-              <option value="ENVIADA" {"selected" if filtro_status == "ENVIADA" else ""}>Enviada</option>
-              <option value="ERRO_ENVIO" {"selected" if filtro_status == "ERRO_ENVIO" else ""}>Erro</option>
-            </select>
-          </div>
+        <div class="filter-grid">
+          <input name="id" placeholder="Filtrar ID Painel" value="{fv('id')}">
+          <select name="status_envio">
+            <option value="" {"selected" if not filtros.get("status_envio") else ""}>Status: Todos</option>
+            <option value="PENDENTE" {"selected" if filtros.get("status_envio") == "PENDENTE" else ""}>Pendente</option>
+            <option value="ENVIADA" {"selected" if filtros.get("status_envio") == "ENVIADA" else ""}>Enviada</option>
+            <option value="ERRO_ENVIO" {"selected" if filtros.get("status_envio") == "ERRO_ENVIO" else ""}>Erro</option>
+          </select>
+          <input name="numero_os" placeholder="Filtrar Nº O.S. FrotaWeb" value="{fv('numero_os')}">
+          <input name="servicos" placeholder="Filtrar Serviços" value="{fv('servicos')}">
+          <input name="codigo_veiculo" placeholder="Filtrar Veículo" value="{fv('codigo_veiculo')}">
+          <input name="placa" placeholder="Filtrar Placa" value="{fv('placa')}">
+          <input name="hodometro" placeholder="Filtrar KM" value="{fv('hodometro')}">
+          <input name="data_hora_abertura" placeholder="Filtrar Abertura/Data" value="{fv('data_hora_abertura')}">
+          <input name="data_hora_saida" placeholder="Filtrar Saída" value="{fv('data_hora_saida')}">
+          <input name="codigo_filial" placeholder="Filtrar Filial" value="{fv('codigo_filial')}">
+          <input name="codigo_departamento" placeholder="Filtrar Departamento" value="{fv('codigo_departamento')}">
+          <input name="descricao_defeito" placeholder="Filtrar Defeito" value="{fv('descricao_defeito')}">
+          <input name="retorno_envio" placeholder="Filtrar Retorno" value="{fv('retorno_envio')}">
+          <input name="created_at" placeholder="Filtrar Criado em" value="{fv('created_at')}">
+          <select name="fotos">
+            <option value="" {"selected" if not filtros.get("fotos") else ""}>Fotos: Todos</option>
+            <option value="com_foto" {"selected" if filtros.get("fotos") == "com_foto" else ""}>Somente com foto</option>
+          </select>
         </div>
-        <div class="acoes"><button type="submit">Filtrar</button><a class="btn btn-gray" href="/painel/ordens-servico">Limpar</a><a class="btn btn-gray" href="/docs">Docs</a></div>
+        <div class="acoes">
+          <button type="submit">Filtrar</button>
+          <a class="btn btn-gray" href="/painel/ordens-servico">Limpar</a>
+          <a class="btn btn-gray" href="/docs">Docs</a>
+        </div>
       </form>
     </div>
     <div class="card" style="padding:0; overflow:auto;">
       <h2 style="padding:18px; margin:0;">Ordens de Serviço</h2>
-      <table><thead><tr><th>ID Painel</th><th>Status</th><th>Nº O.S. FrotaWeb</th><th>Serviços</th><th>Veículo</th><th>Placa</th><th>KM</th><th>Abertura</th><th>Saída</th><th>Filial</th><th>Departamento</th><th>Defeito</th><th>Retorno</th><th>Criado em</th><th>Ação</th></tr></thead>
-      <tbody>{linhas_os if linhas_os else '<tr><td colspan="15">Nenhuma O.S. encontrada</td></tr>'}</tbody></table>
+      <table><thead><tr><th>ID Painel</th><th>Status</th><th>Nº O.S. FrotaWeb</th><th>Serviços</th><th>Veículo</th><th>Placa</th><th>KM</th><th>Abertura</th><th>Saída</th><th>Filial</th><th>Departamento</th><th>Defeito</th><th>Fotos</th><th>Retorno</th><th>Criado em</th><th>Ação</th></tr></thead>
+      <tbody>{linhas_os if linhas_os else '<tr><td colspan="16">Nenhuma O.S. encontrada</td></tr>'}</tbody></table>
     </div>
     <div class="card" style="padding:0; overflow:auto;">
       <h2 style="padding:18px; margin:0;">Serviços da O.S.</h2>
@@ -756,6 +1029,7 @@ async def receber_os(request: Request, db: Session = Depends(get_db)):
         raise HTTPException(status_code=400, detail="Informe codigo_veiculo ou placa")
 
     c = p["credenciais"]
+    fotos_recebidas = salvar_fotos_app(dados)
     ordem = OrdemServico(
         empresa=c["empresa"], usuario=c["usuario"], senha=c["senha"], filial=c["filial"], recurso_humano=c["recurso_humano"],
         codigo_veiculo=p["codigo_veiculo"], descricao_defeito=p["descricao_defeito"], numero_os=p["numero_os"], placa=p["placa"],
@@ -767,12 +1041,26 @@ async def receber_os(request: Request, db: Session = Depends(get_db)):
         codigo_solicitante=p["codigo_solicitante"], codigo_motorista=p["codigo_motorista"], numero_ocorrencia=p["numero_ocorrencia"],
         numero_contrato=p["numero_contrato"], valor_acrescimo=p["valor_acrescimo"], numero_os_retorno=p["numero_os_retorno"], observacoes=p["observacoes"],
         investimento=p["investimento"], acidente=p["acidente"], socorro=p["socorro"], servico_retorno=p["servico_retorno"], programada=p["programada"],
-        status_envio="PENDENTE", retorno_envio="O.S. salva no painel. Aguardando envio manual.", payload_original=str(dados), campos_brutos=str(p["campos_brutos"]),
+        status_envio="PENDENTE",
+        retorno_envio="O.S. salva no painel. Aguardando envio manual.",
+        payload_original=json_dumps_safe(mascarar_senha(dados)),
+        campos_brutos=json_dumps_safe(p["campos_brutos"]),
+        fotos_app=json_dumps_safe(fotos_recebidas),
+        app_payload=json_dumps_safe(dados),
     )
     db.add(ordem)
     db.commit()
     db.refresh(ordem)
-    return {"ok": True, "created": True, "id": ordem.id, "order_number": str(ordem.id), "status_envio": ordem.status_envio, "message": "O.S. salva no painel.", "payload_tryout": payload_os_from_ordem(ordem)}
+    return {
+        "ok": True,
+        "created": True,
+        "id": ordem.id,
+        "order_number": str(ordem.id),
+        "status_envio": ordem.status_envio,
+        "message": "O.S. salva no painel.",
+        "fotos_recebidas": len(fotos_recebidas),
+        "payload_tryout": payload_os_from_ordem(ordem),
+    }
 
 
 @app.post("/panel/os/servicos")
@@ -819,13 +1107,155 @@ def listar_servicos(status_envio: Optional[str] = Query(None), db: Session = Dep
 
 
 @app.get("/painel/ordens-servico", response_class=HTMLResponse)
-def painel(status_envio: Optional[str] = Query(None), msg: Optional[str] = Query(None), db: Session = Depends(get_db)):
+def painel(
+    id: Optional[str] = Query(None),
+    status_envio: Optional[str] = Query(None),
+    numero_os: Optional[str] = Query(None),
+    servicos: Optional[str] = Query(None),
+    codigo_veiculo: Optional[str] = Query(None),
+    placa: Optional[str] = Query(None),
+    hodometro: Optional[str] = Query(None),
+    data_hora_abertura: Optional[str] = Query(None),
+    data_hora_saida: Optional[str] = Query(None),
+    codigo_filial: Optional[str] = Query(None),
+    codigo_departamento: Optional[str] = Query(None),
+    descricao_defeito: Optional[str] = Query(None),
+    retorno_envio: Optional[str] = Query(None),
+    created_at: Optional[str] = Query(None),
+    fotos: Optional[str] = Query(None),
+    msg: Optional[str] = Query(None),
+    db: Session = Depends(get_db),
+):
     qo = db.query(OrdemServico).filter(OrdemServico.deleted_at.is_(None))
     qs = db.query(ServicoOS).filter(ServicoOS.deleted_at.is_(None))
-    if status_envio:
-        qo = qo.filter(OrdemServico.status_envio == status_envio)
-        qs = qs.filter(ServicoOS.status_envio == status_envio)
-    return HTMLResponse(render_painel(qo.order_by(OrdemServico.created_at.desc()).all(), qs.order_by(ServicoOS.created_at.desc()).all(), status_envio or "", msg or ""))
+    ordens = qo.order_by(OrdemServico.created_at.desc()).all()
+    servicos_lista = qs.order_by(ServicoOS.created_at.desc()).all()
+
+    filtros = {
+        "id": id or "",
+        "status_envio": status_envio or "",
+        "numero_os": numero_os or "",
+        "servicos": servicos or "",
+        "codigo_veiculo": codigo_veiculo or "",
+        "placa": placa or "",
+        "hodometro": hodometro or "",
+        "data_hora_abertura": data_hora_abertura or "",
+        "data_hora_saida": data_hora_saida or "",
+        "codigo_filial": codigo_filial or "",
+        "codigo_departamento": codigo_departamento or "",
+        "descricao_defeito": descricao_defeito or "",
+        "retorno_envio": retorno_envio or "",
+        "created_at": created_at or "",
+        "fotos": fotos or "",
+    }
+    return HTMLResponse(render_painel(ordens, servicos_lista, filtros, msg or ""))
+
+
+
+@app.get("/painel/ordens-servico/editar/{ordem_id}", response_class=HTMLResponse)
+def editar_ordem(ordem_id: int, db: Session = Depends(get_db)):
+    ordem = db.query(OrdemServico).filter(OrdemServico.id == ordem_id).filter(OrdemServico.deleted_at.is_(None)).first()
+    if not ordem:
+        raise HTTPException(status_code=404, detail="O.S. nao encontrada")
+
+    campos_html = ""
+    for field_name, label, field_type in ordem_edit_fields():
+        campos_html += render_edit_form_field(ordem, field_name, label, field_type)
+
+    checks_html = ""
+    checks_html += render_checkbox("investimento", "Investimento", bool(ordem.investimento))
+    checks_html += render_checkbox("acidente", "Acidente", bool(ordem.acidente))
+    checks_html += render_checkbox("socorro", "Socorro", bool(ordem.socorro))
+    checks_html += render_checkbox("servico_retorno", "Serviço retorno", bool(ordem.servico_retorno))
+    checks_html += render_checkbox("programada", "Programada", bool(ordem.programada))
+
+    payload_original = json.dumps(payload_original_dict(ordem), ensure_ascii=False, indent=2)
+
+    corpo = f"""
+    <div class="card">
+      <h2>Fotos recebidas do aplicativo</h2>
+      {html_fotos_ordem(ordem)}
+    </div>
+
+    <form method="post" action="/painel/ordens-servico/editar/{ordem.id}">
+      <div class="card">
+        <h2>Descrição e campos da O.S.</h2>
+        <p class="small">Edite aqui todos os campos recebidos do aplicativo antes de enviar ao FrotaWeb.</p>
+        <div class="grid">{campos_html}</div>
+        <h3>Marcadores</h3>
+        <div class="acoes">{checks_html}</div>
+      </div>
+
+      <div class="card">
+        <h2>JSON original recebido do app</h2>
+        <p class="small">Campo de conferência. Pode ser editado, mas os campos acima são os usados para enviar ao FrotaWeb.</p>
+        <textarea name="app_payload" style="min-height:260px;font-family:monospace;">{escape_html(payload_original)}</textarea>
+      </div>
+
+      <div class="acoes">
+        <button type="submit" class="btn-green">Salvar alterações</button>
+        <a href="/painel/ordens-servico" class="btn btn-gray">Voltar</a>
+      </div>
+    </form>
+
+    <div class="card">
+      <form method="post" action="/painel/ordens-servico/deletar/{ordem.id}" onsubmit="return confirm('Deletar a O.S. {ordem.id}?');">
+        <button type="submit" class="btn-red">Deletar O.S.</button>
+      </form>
+    </div>
+    """
+    return HTMLResponse(html_base(f"Editar O.S. {ordem.id}", corpo))
+
+
+@app.post("/painel/ordens-servico/editar/{ordem_id}")
+async def salvar_edicao_ordem(ordem_id: int, request: Request, db: Session = Depends(get_db)):
+    ordem = db.query(OrdemServico).filter(OrdemServico.id == ordem_id).filter(OrdemServico.deleted_at.is_(None)).first()
+    if not ordem:
+        raise HTTPException(status_code=404, detail="O.S. nao encontrada")
+
+    form = await request.form()
+
+    for field_name, _, _ in ordem_edit_fields():
+        if field_name in form:
+            setattr(ordem, field_name, str(form.get(field_name) or "").strip())
+
+    ordem.investimento = form.get("investimento") == "true"
+    ordem.acidente = form.get("acidente") == "true"
+    ordem.socorro = form.get("socorro") == "true"
+    ordem.servico_retorno = form.get("servico_retorno") == "true"
+    ordem.programada = form.get("programada") == "true"
+
+    app_payload_text = str(form.get("app_payload") or "").strip()
+    if app_payload_text:
+        try:
+            ordem.app_payload = json_dumps_safe(json.loads(app_payload_text))
+        except Exception:
+            ordem.app_payload = app_payload_text
+
+    ordem.retorno_envio = "O.S. editada no painel. Aguardando envio manual."
+    ordem.status_envio = "PENDENTE"
+    db.commit()
+
+    return RedirectResponse(url=f"/painel/ordens-servico/editar/{ordem.id}", status_code=303)
+
+
+@app.post("/painel/ordens-servico/deletar/{ordem_id}")
+def deletar_ordem(ordem_id: int, db: Session = Depends(get_db)):
+    ordem = db.query(OrdemServico).filter(OrdemServico.id == ordem_id).filter(OrdemServico.deleted_at.is_(None)).first()
+    if not ordem:
+        raise HTTPException(status_code=404, detail="O.S. nao encontrada")
+
+    ordem.deleted_at = func.now()
+
+    servicos = db.query(ServicoOS).filter(
+        (ServicoOS.numero_os == str(ordem.id)) | (ServicoOS.numero_os == str(ordem.numero_os or ""))
+    ).all()
+    for serv in servicos:
+        serv.deleted_at = func.now()
+
+    db.commit()
+    return RedirectResponse(url="/painel/ordens-servico?msg=O.S.%20deletada%20com%20sucesso", status_code=303)
+
 
 
 @app.post("/painel/ordens-servico/enviar/{ordem_id}")
