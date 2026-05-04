@@ -1,4 +1,5 @@
 import os
+import json
 import shutil
 import base64
 from io import BytesIO
@@ -32,6 +33,19 @@ UPLOAD_DIR = "uploads/fotos"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 app.mount("/fotos", StaticFiles(directory=UPLOAD_DIR), name="fotos")
+
+
+# Endpoints da API que realmente envia ao FrotaWeb.
+# Configure no Render se precisar trocar.
+FROTAWEB_OS_URL = os.getenv(
+    "FROTAWEB_OS_URL",
+    "https://frotaweb-os-corretiva-api.onrender.com/os-corretiva?simulacao=false",
+)
+FROTAWEB_SERVICO_URL = os.getenv(
+    "FROTAWEB_SERVICO_URL",
+    "https://frotaweb-os-corretiva-api.onrender.com/os-corretiva/servicos?simulacao=false",
+)
+
 
 
 # =========================
@@ -97,6 +111,12 @@ class OrdemServicoModel(Base):
     data_cadastro = Column(String, nullable=True, index=True)
     foto = Column(String, nullable=True)
 
+    # Controle do envio manual ao FrotaWeb
+    frotaweb_status = Column(String, nullable=False, default="PENDENTE")
+    frotaweb_numero_os = Column(String, nullable=True)
+    frotaweb_retorno = Column(String, nullable=True)
+    frotaweb_payload = Column(String, nullable=True)
+
     itens = relationship(
         "OrdemServicoItemModel",
         back_populates="ordem",
@@ -116,6 +136,11 @@ class OrdemServicoItemModel(Base):
     id = Column(Integer, primary_key=True, index=True)
     ordem_id = Column(Integer, ForeignKey("ordens_servico.id"), nullable=False, index=True)
     servico = Column(String, nullable=False, index=True)
+
+    # Controle do envio manual do serviço ao FrotaWeb
+    frotaweb_status = Column(String, nullable=False, default="PENDENTE")
+    frotaweb_retorno = Column(String, nullable=True)
+    frotaweb_payload = Column(String, nullable=True)
 
     ordem = relationship("OrdemServicoModel", back_populates="itens")
 
@@ -370,6 +395,9 @@ def buscar_linhas_ordens(
             OrdemServicoModel.observacoes.label("observacoes"),
             OrdemServicoModel.data_cadastro.label("data_cadastro"),
             OrdemServicoModel.foto.label("foto"),
+            OrdemServicoModel.frotaweb_status.label("frotaweb_status"),
+            OrdemServicoModel.frotaweb_numero_os.label("frotaweb_numero_os"),
+            OrdemServicoModel.frotaweb_retorno.label("frotaweb_retorno"),
         )
         .join(OrdemServicoItemModel, OrdemServicoItemModel.ordem_id == OrdemServicoModel.id)
     )
@@ -464,6 +492,191 @@ def juntar_data_hora(data_cadastro: str, hora: str) -> str:
         return f"{data_cadastro.strip()} {hora.strip()}"
 
 
+def _safe_json_dumps(data: Any) -> str:
+    try:
+        return json.dumps(data, ensure_ascii=False)
+    except Exception:
+        return str(data)
+
+
+def _safe_json_loads(data: str) -> Dict[str, Any]:
+    try:
+        value = json.loads(data or "{}")
+        return value if isinstance(value, dict) else {}
+    except Exception:
+        return {}
+
+
+def _texto(payload: Dict[str, Any], *nomes: str, default: str = "") -> str:
+    for nome in nomes:
+        if "." in nome:
+            grupo, chave = nome.split(".", 1)
+            origem = payload.get(grupo) or {}
+            valor = origem.get(chave) if isinstance(origem, dict) else None
+        else:
+            valor = payload.get(nome)
+        if valor is not None and str(valor).strip() != "":
+            return str(valor).strip()
+    return default
+
+
+def _booleano(payload: Dict[str, Any], *nomes: str, default: bool = False) -> bool:
+    for nome in nomes:
+        valor = payload.get(nome)
+        if isinstance(valor, bool):
+            return valor
+        if isinstance(valor, int):
+            return valor == 1
+        if isinstance(valor, str):
+            return valor.strip().lower() in ("1", "true", "sim", "s", "yes")
+    return default
+
+
+def _credenciais_payload(payload: Dict[str, Any]) -> Dict[str, str]:
+    creds = payload.get("credenciais") or payload.get("credentials") or {}
+    if not isinstance(creds, dict):
+        creds = {}
+    usuario = _texto(creds, "usuario")
+    return {
+        "empresa": _texto(creds, "empresa", default="1"),
+        "usuario": usuario,
+        "senha": _texto(creds, "senha"),
+        "filial": _texto(creds, "filial", default=_texto(payload, "codigo_filial", "branch_code", default="1")),
+        "recurso_humano": _texto(creds, "recurso_humano", "recurso", default=usuario),
+    }
+
+
+def _data_apenas(data_hora: str) -> str:
+    data_hora = (data_hora or "").strip()
+    return data_hora.split(" ")[0] if data_hora else ""
+
+
+def montar_payload_os_frotaweb(payload: Dict[str, Any]) -> Dict[str, Any]:
+    abertura = _texto(payload, "data_hora_abertura", "opening_datetime", "dh_entrada")
+    saida = _texto(payload, "data_hora_saida", "exit_datetime", "dh_saida")
+    hodometro = _texto(payload, "hodometro", "odometer", "km_entrada", default="0")
+
+    return {
+        "credenciais": _credenciais_payload(payload),
+        "codigo_veiculo": _texto(payload, "codigo_veiculo", "vehicle_code", "cd_veiculo"),
+        "descricao_defeito": _texto(payload, "descricao_defeito", "defect_description", "observacao", "observacoes"),
+        "numero_os": _texto(payload, "numero_os", "order_number", default=""),
+        "placa": _texto(payload, "placa", "plate").upper(),
+        "codigo_componente": _texto(payload, "codigo_componente", "component_code", default=""),
+        "data_abertura": _texto(payload, "data_abertura", default=_data_apenas(abertura)),
+        "data_hora_abertura": abertura,
+        "hodometro": hodometro,
+        "horimetro_entrada": _texto(payload, "horimetro_entrada", "entry_hourmeter", default="0"),
+        "data_hora_saida": saida,
+        "hodometro_saida": _texto(payload, "hodometro_saida", "exit_odometer", default=hodometro),
+        "horimetro_saida": _texto(payload, "horimetro_saida", "exit_hourmeter", default="0"),
+        "data_hora_inicio": _texto(payload, "data_hora_inicio", "start_datetime", default=abertura),
+        "data_hora_previsao_liberacao": _texto(payload, "data_hora_previsao_liberacao", "expected_release_datetime", default=saida),
+        "horas_previstas": _texto(payload, "horas_previstas", "expected_hours", default="0.00"),
+        "horas_realizadas": _texto(payload, "horas_realizadas", "actual_hours", "performed_hours", default="0"),
+        "codigo_filial": _texto(payload, "codigo_filial", "branch_code", "cd_filial"),
+        "codigo_departamento": _texto(payload, "codigo_departamento", "department_code", "cd_ccusto"),
+        "codigo_oficina": _texto(payload, "codigo_oficina", "workshop_code", default=""),
+        "codigo_servico": _texto(payload, "codigo_servico", "service_code", default=""),
+        "codigo_solicitante": _texto(payload, "codigo_solicitante", "requester_code", default=""),
+        "codigo_motorista": _texto(payload, "codigo_motorista", "driver_code", default="0"),
+        "numero_ocorrencia": _texto(payload, "numero_ocorrencia", "occurrence_number", default="0"),
+        "numero_contrato": _texto(payload, "numero_contrato", "contract_number", default=""),
+        "valor_acrescimo": _texto(payload, "valor_acrescimo", "surcharge_value", "additional_value", default="0"),
+        "numero_os_retorno": _texto(payload, "numero_os_retorno", "return_order_number", default="0"),
+        "observacoes": _texto(payload, "observacoes", "observations", default=""),
+        "investimento": _booleano(payload, "investimento", "investment"),
+        "acidente": _booleano(payload, "acidente", "accident"),
+        "socorro": _booleano(payload, "socorro", "roadside_assistance"),
+        "servico_retorno": _booleano(payload, "servico_retorno", "return_service"),
+        "programada": _booleano(payload, "programada", "scheduled"),
+        "campos_brutos": payload.get("campos_brutos") if isinstance(payload.get("campos_brutos"), dict) else {},
+    }
+
+
+def montar_payload_servico_frotaweb(payload: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "credenciais": _credenciais_payload(payload),
+        "numero_os": _texto(payload, "numero_os", "order_number"),
+        "codigo_veiculo": _texto(payload, "codigo_veiculo", "vehicle_code", "cd_veiculo"),
+        "placa": _texto(payload, "placa", "plate").upper(),
+        "codigo_servico": _texto(payload, "codigo_servico", "service_code", default="0"),
+        "codigo_recurso_humano": _texto(
+            payload,
+            "codigo_recurso_humano",
+            "resource_code",
+            "recurso_humano",
+            default=_credenciais_payload(payload).get("recurso_humano", ""),
+        ),
+        "tempo_gasto": _texto(payload, "tempo_gasto", "spent_time", default="000:00"),
+        "valor_hora": _texto(payload, "valor_hora", "hourly_value", default="0"),
+        "campos_brutos": payload.get("campos_brutos") if isinstance(payload.get("campos_brutos"), dict) else {},
+    }
+
+
+def mascarar_senha(obj: Any) -> Any:
+    if isinstance(obj, dict):
+        novo = {}
+        for chave, valor in obj.items():
+            if str(chave).lower() == "senha":
+                novo[chave] = "***"
+            else:
+                novo[chave] = mascarar_senha(valor)
+        return novo
+    if isinstance(obj, list):
+        return [mascarar_senha(item) for item in obj]
+    return obj
+
+
+def post_json_frotaweb(url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        resp = requests.post(url, json=payload, timeout=180)
+    except requests.RequestException as exc:
+        raise HTTPException(status_code=500, detail=f"Erro ao conectar na API FrotaWeb: {str(exc)}")
+
+    try:
+        retorno = resp.json()
+    except Exception:
+        retorno = {"raw": resp.text[:3000]}
+
+    if resp.status_code not in (200, 201):
+        raise HTTPException(
+            status_code=resp.status_code,
+            detail={
+                "url": url,
+                "payload_enviado": mascarar_senha(payload),
+                "retorno": retorno,
+            },
+        )
+
+    return retorno
+
+
+def extrair_numero_os(retorno: Any) -> str:
+    candidatos = {
+        "numero_os", "nr_os", "num_os", "os", "codigo_os", "cod_os",
+        "order_number", "ordem_servico", "ordem", "id_os", "id",
+    }
+
+    def walk(obj):
+        if isinstance(obj, dict):
+            for chave, valor in obj.items():
+                if str(chave).lower() in candidatos and valor not in (None, "", 0):
+                    return str(valor).strip()
+            for valor in obj.values():
+                encontrado = walk(valor)
+                if encontrado:
+                    return encontrado
+        if isinstance(obj, list):
+            for item in obj:
+                encontrado = walk(item)
+                if encontrado:
+                    return encontrado
+        return ""
+
+    return walk(retorno)
+
+
 # =========================
 # STARTUP
 # =========================
@@ -481,6 +694,17 @@ def startup():
         conn.execute(text("ALTER TABLE ordens_servico ADD COLUMN IF NOT EXISTS observacoes VARCHAR"))
         conn.execute(text("ALTER TABLE ordens_servico ADD COLUMN IF NOT EXISTS data_cadastro VARCHAR"))
         conn.execute(text("ALTER TABLE ordens_servico ADD COLUMN IF NOT EXISTS foto VARCHAR"))
+        conn.execute(text("ALTER TABLE ordens_servico ADD COLUMN IF NOT EXISTS frotaweb_status VARCHAR"))
+        conn.execute(text("ALTER TABLE ordens_servico ADD COLUMN IF NOT EXISTS frotaweb_numero_os VARCHAR"))
+        conn.execute(text("ALTER TABLE ordens_servico ADD COLUMN IF NOT EXISTS frotaweb_retorno VARCHAR"))
+        conn.execute(text("ALTER TABLE ordens_servico ADD COLUMN IF NOT EXISTS frotaweb_payload VARCHAR"))
+
+        conn.execute(text("UPDATE ordens_servico SET frotaweb_status = 'PENDENTE' WHERE frotaweb_status IS NULL"))
+
+        conn.execute(text("ALTER TABLE ordens_servico_itens ADD COLUMN IF NOT EXISTS frotaweb_status VARCHAR"))
+        conn.execute(text("ALTER TABLE ordens_servico_itens ADD COLUMN IF NOT EXISTS frotaweb_retorno VARCHAR"))
+        conn.execute(text("ALTER TABLE ordens_servico_itens ADD COLUMN IF NOT EXISTS frotaweb_payload VARCHAR"))
+        conn.execute(text("UPDATE ordens_servico_itens SET frotaweb_status = 'PENDENTE' WHERE frotaweb_status IS NULL"))
 
         conn.execute(text("UPDATE ordens_servico SET matricula = '' WHERE matricula IS NULL"))
         conn.execute(text("UPDATE ordens_servico SET mecanico = '' WHERE mecanico IS NULL"))
@@ -1648,6 +1872,9 @@ def listar_ordens_servico(
                 "hora_fim": row.hora_fim, "servico": row.servico,
                 "observacoes": row.observacoes, "data_cadastro": row.data_cadastro,
                 "foto_url": row.foto,
+                "frotaweb_status": getattr(row, "frotaweb_status", "PENDENTE"),
+                "frotaweb_numero_os": getattr(row, "frotaweb_numero_os", ""),
+                "frotaweb_retorno": getattr(row, "frotaweb_retorno", ""),
             }
             for row in rows
         ]
@@ -1813,6 +2040,8 @@ async def receber_os_app_no_painel(payload: Dict[str, Any], db: Session = Depend
 
     foto_path = _salvar_primeira_foto_app(payload)
 
+    payload_frotaweb = montar_payload_os_frotaweb(payload)
+
     nova_ordem = OrdemServicoModel(
         placa=placa.strip().upper(),
         matricula=matricula.strip(),
@@ -1823,6 +2052,8 @@ async def receber_os_app_no_painel(payload: Dict[str, Any], db: Session = Depend
         observacoes=observacao_final,
         data_cadastro=_normalizar_data_painel(abertura),
         foto=foto_path,
+        frotaweb_status="PENDENTE",
+        frotaweb_payload=_safe_json_dumps(payload_frotaweb),
     )
 
     db.add(nova_ordem)
@@ -1834,7 +2065,11 @@ async def receber_os_app_no_painel(payload: Dict[str, Any], db: Session = Depend
         "codigo_servico",
         default="Corretiva pendente de conferencia",
     )
-    db.add(OrdemServicoItemModel(ordem_id=nova_ordem.id, servico=servico_base))
+    db.add(OrdemServicoItemModel(
+        ordem_id=nova_ordem.id,
+        servico=servico_base,
+        frotaweb_status="PENDENTE",
+    ))
 
     db.commit()
     db.refresh(nova_ordem)
@@ -1874,7 +2109,21 @@ async def receber_servico_app_no_painel(payload: Dict[str, Any], db: Session = D
     if tempo:
         descricao = f"{descricao} - Tempo: {tempo}"
 
-    db.add(OrdemServicoItemModel(ordem_id=ordem.id, servico=descricao))
+    payload_servico = montar_payload_servico_frotaweb(payload)
+    numero_os_frotaweb = ordem.frotaweb_numero_os or str(ordem.id)
+    payload_servico["numero_os"] = payload_servico.get("numero_os") or numero_os_frotaweb
+    if not payload_servico.get("codigo_veiculo"):
+        payload_os = _safe_json_loads(ordem.frotaweb_payload or "{}")
+        payload_servico["codigo_veiculo"] = payload_os.get("codigo_veiculo", "")
+    if not payload_servico.get("placa"):
+        payload_servico["placa"] = ordem.placa or ""
+
+    db.add(OrdemServicoItemModel(
+        ordem_id=ordem.id,
+        servico=descricao,
+        frotaweb_status="PENDENTE",
+        frotaweb_payload=_safe_json_dumps(payload_servico),
+    ))
     db.commit()
 
     return {
@@ -1882,6 +2131,132 @@ async def receber_servico_app_no_painel(payload: Dict[str, Any], db: Session = D
         "accepted": False,
         "order_number": str(ordem.id),
         "message": f"Servico salvo no painel na O.S. {ordem.id}. Nao foi enviado ao FrotaWeb.",
+    }
+
+
+@app.post("/painel/ordens-servico/{ordem_id}/enviar-frotaweb")
+def enviar_ordem_painel_para_frotaweb(request: Request, ordem_id: int, db: Session = Depends(get_db)):
+    """
+    Envia manualmente uma O.S. do painel para a API FrotaWeb.
+    Depois de enviar a O.S., tenta enviar automaticamente os serviços vinculados.
+    """
+    if not usuario_logado(request):
+        return RedirectResponse(url="/login", status_code=303)
+
+    ordem = db.query(OrdemServicoModel).filter(OrdemServicoModel.id == ordem_id).first()
+    if ordem is None:
+        raise HTTPException(status_code=404, detail="O.S. não encontrada")
+
+    payload_os = _safe_json_loads(ordem.frotaweb_payload or "{}")
+    if not payload_os:
+        payload_os = montar_payload_os_frotaweb({
+            "placa": ordem.placa,
+            "hodometro": ordem.km,
+            "data_hora_abertura": juntar_data_hora(ordem.data_cadastro or "", ordem.hora_inicio or ""),
+            "data_hora_saida": juntar_data_hora(ordem.data_cadastro or "", ordem.hora_fim or ""),
+            "observacoes": ordem.observacoes or "",
+            "credenciais": {
+                "empresa": "1",
+                "usuario": ordem.mecanico or ordem.matricula or "",
+                "senha": "",
+                "filial": "",
+                "recurso_humano": ordem.matricula or "",
+            }
+        })
+
+    try:
+        retorno_os = post_json_frotaweb(FROTAWEB_OS_URL, payload_os)
+    except HTTPException as exc:
+        ordem.frotaweb_status = "ERRO_ENVIO"
+        ordem.frotaweb_retorno = _safe_json_dumps(exc.detail)
+        db.commit()
+        return RedirectResponse(url="/painel/ordens-servico?servico=Erro%20FrotaWeb", status_code=303)
+
+    numero_os = extrair_numero_os(retorno_os)
+    if numero_os:
+        ordem.frotaweb_numero_os = numero_os
+
+    servicos = db.query(OrdemServicoItemModel).filter(OrdemServicoItemModel.ordem_id == ordem.id).all()
+    total_servicos = len(servicos)
+    servicos_enviados = 0
+    servicos_erros = 0
+
+    for item in servicos:
+        # Não envia item base quando não houver payload real de serviço salvo pelo app.
+        payload_servico = _safe_json_loads(item.frotaweb_payload or "{}")
+        if not payload_servico:
+            item.frotaweb_status = item.frotaweb_status or "PENDENTE"
+            continue
+
+        payload_servico["numero_os"] = numero_os or ordem.frotaweb_numero_os or str(ordem.id)
+
+        try:
+            retorno_servico = post_json_frotaweb(FROTAWEB_SERVICO_URL, payload_servico)
+            item.frotaweb_status = "ENVIADA"
+            item.frotaweb_retorno = _safe_json_dumps(mascarar_senha(retorno_servico))
+            servicos_enviados += 1
+        except HTTPException as exc:
+            item.frotaweb_status = "ERRO_ENVIO"
+            item.frotaweb_retorno = _safe_json_dumps(exc.detail)
+            servicos_erros += 1
+
+    ordem.frotaweb_status = "ENVIADA"
+    ordem.frotaweb_retorno = (
+        f"O.S. enviada com sucesso. "
+        f"Nº O.S. FrotaWeb: {ordem.frotaweb_numero_os or 'não identificado'}. "
+        f"Serviços: {servicos_enviados}/{total_servicos} enviados, {servicos_erros} erro(s). "
+        f"Retorno: {_safe_json_dumps(mascarar_senha(retorno_os))}"
+    )
+    db.commit()
+
+    return RedirectResponse(url="/painel/ordens-servico", status_code=303)
+
+
+@app.post("/ordens-servico/{ordem_id}/enviar-frotaweb")
+def enviar_ordem_painel_para_frotaweb_json(ordem_id: int, db: Session = Depends(get_db)):
+    """
+    Versão JSON do envio manual para testes via /docs.
+    """
+    ordem = db.query(OrdemServicoModel).filter(OrdemServicoModel.id == ordem_id).first()
+    if ordem is None:
+        raise HTTPException(status_code=404, detail="O.S. não encontrada")
+
+    payload_os = _safe_json_loads(ordem.frotaweb_payload or "{}")
+    if not payload_os:
+        raise HTTPException(status_code=400, detail="O.S. não possui payload FrotaWeb salvo")
+
+    retorno_os = post_json_frotaweb(FROTAWEB_OS_URL, payload_os)
+    numero_os = extrair_numero_os(retorno_os)
+    if numero_os:
+        ordem.frotaweb_numero_os = numero_os
+
+    servicos = db.query(OrdemServicoItemModel).filter(OrdemServicoItemModel.ordem_id == ordem.id).all()
+    resumo_servicos = []
+    for item in servicos:
+        payload_servico = _safe_json_loads(item.frotaweb_payload or "{}")
+        if not payload_servico:
+            resumo_servicos.append({"id": item.id, "status": "SEM_PAYLOAD"})
+            continue
+        payload_servico["numero_os"] = numero_os or ordem.frotaweb_numero_os or str(ordem.id)
+        try:
+            retorno_servico = post_json_frotaweb(FROTAWEB_SERVICO_URL, payload_servico)
+            item.frotaweb_status = "ENVIADA"
+            item.frotaweb_retorno = _safe_json_dumps(mascarar_senha(retorno_servico))
+            resumo_servicos.append({"id": item.id, "status": "ENVIADA", "retorno": mascarar_senha(retorno_servico)})
+        except HTTPException as exc:
+            item.frotaweb_status = "ERRO_ENVIO"
+            item.frotaweb_retorno = _safe_json_dumps(exc.detail)
+            resumo_servicos.append({"id": item.id, "status": "ERRO_ENVIO", "erro": exc.detail})
+
+    ordem.frotaweb_status = "ENVIADA"
+    ordem.frotaweb_retorno = _safe_json_dumps(mascarar_senha(retorno_os))
+    db.commit()
+
+    return {
+        "ok": True,
+        "numero_os_frotaweb": ordem.frotaweb_numero_os,
+        "retorno_os": mascarar_senha(retorno_os),
+        "servicos": resumo_servicos,
     }
 
 
@@ -2405,7 +2780,7 @@ def painel_ordens_servico(
               <tr>
                 <th>ID</th><th>Placa</th><th>Matrícula</th><th>Mecânico</th><th>KM</th>
                 <th>Hora início</th><th>Hora fim</th><th>Serviço / Produtos</th>
-                <th>Foto</th><th>Observações</th><th>Data cadastro</th><th>Ações</th>
+                <th>Foto</th><th>Observações</th><th>Status FrotaWeb</th><th>Nº O.S. FrotaWeb</th><th>Retorno FrotaWeb</th><th>Data cadastro</th><th>Ações</th>
               </tr>
             </thead>
             <tbody>
@@ -2445,7 +2820,17 @@ def painel_ordens_servico(
 
             botao_excluir = ""
             if primeira_linha_da_ordem:
+                botao_enviar_frotaweb = ""
+                if (ordem.frotaweb_status or "PENDENTE") != "ENVIADA":
+                    botao_enviar_frotaweb = f"""
+                    <form class="inline" method="post" action="/painel/ordens-servico/{row.id}/enviar-frotaweb"
+                          onsubmit="return confirm('Enviar a O.S. {row.id} para o FrotaWeb agora?');">
+                      <button type="submit" class="btn btn-exportar">Enviar FrotaWeb</button>
+                    </form>
+                    """
+
                 botao_excluir = f"""
+                {botao_enviar_frotaweb}
                 <form class="inline" method="post" action="/ordens-servico/{row.id}/excluir"
                       onsubmit="return confirm('Deseja excluir a O.S. {row.id}?');">
                   <button type="submit" class="btn btn-excluir">Excluir</button>
@@ -2465,12 +2850,15 @@ def painel_ordens_servico(
                     <td>{escape_html(row.servico)}{produtos_html}</td>
                     <td>{foto_html}</td>
                     <td>{escape_html(observacoes)}</td>
+                    <td>{escape_html(ordem.frotaweb_status if ordem else getattr(row, "frotaweb_status", "PENDENTE"))}</td>
+                    <td>{escape_html(ordem.frotaweb_numero_os if ordem else getattr(row, "frotaweb_numero_os", ""))}</td>
+                    <td style="white-space:normal;max-width:320px;">{escape_html((ordem.frotaweb_retorno if ordem else getattr(row, "frotaweb_retorno", "")) or "")[:500]}</td>
                     <td>{escape_html(row.data_cadastro)}</td>
                     <td>{botao_excluir}</td>
                   </tr>
                 """
     else:
-        html += "<tr><td colspan='12' style='text-align:center;'>Nenhum registro encontrado</td></tr>"
+        html += "<tr><td colspan='15' style='text-align:center;'>Nenhum registro encontrado</td></tr>"
 
     html += "</tbody></table></div></body></html>"
     return html
@@ -2494,6 +2882,9 @@ def exportar_ordens_json(
             "hora_fim": row.hora_fim, "servico": row.servico,
             "observacoes": row.observacoes, "data_cadastro": row.data_cadastro,
             "foto_url": row.foto,
+            "frotaweb_status": getattr(row, "frotaweb_status", "PENDENTE"),
+            "frotaweb_numero_os": getattr(row, "frotaweb_numero_os", ""),
+            "frotaweb_retorno": getattr(row, "frotaweb_retorno", ""),
         }
         for row in rows
     ])
@@ -2515,12 +2906,13 @@ def exportar_ordens_xlsx(
     wb = Workbook()
     ws = wb.active
     ws.title = "OrdensServico"
-    ws.append(["ID", "Placa", "Matrícula", "Mecânico", "KM", "Hora início", "Hora fim", "Serviço", "Observações", "Data cadastro", "Foto URL"])
+    ws.append(["ID", "Placa", "Matrícula", "Mecânico", "KM", "Hora início", "Hora fim", "Serviço", "Observações", "Status FrotaWeb", "Nº O.S. FrotaWeb", "Retorno FrotaWeb", "Data cadastro", "Foto URL"])
 
     for row in rows:
         ws.append([
             row.id, row.placa, row.matricula, row.mecanico, row.km,
             row.hora_inicio, row.hora_fim, row.servico, row.observacoes,
+            getattr(row, "frotaweb_status", "PENDENTE"), getattr(row, "frotaweb_numero_os", ""), getattr(row, "frotaweb_retorno", ""),
             row.data_cadastro, row.foto or "",
         ])
 
