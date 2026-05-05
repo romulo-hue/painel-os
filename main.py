@@ -897,6 +897,23 @@ def render_checkbox(name: str, label: str, checked: bool) -> str:
     """
 
 
+def unique_suggestions(values: list[Any], limit: int = 120) -> list[str]:
+    vistos: list[str] = []
+    for value in values:
+        texto = str(value or "").strip()
+        if not texto or texto in vistos:
+            continue
+        vistos.append(texto)
+    return vistos[:limit]
+
+
+def render_datalist(name: str, options: list[str]) -> str:
+    if not options:
+        return ""
+    itens = "".join(f"<option value='{escape_html(option)}'></option>" for option in options)
+    return f"<datalist id='lista-{escape_html(name)}'>{itens}</datalist>"
+
+
 # =========================================================
 # HTML
 # =========================================================
@@ -950,8 +967,32 @@ def html_base(titulo: str, corpo: str, msg: str = "") -> str:
         .retorno-detalhes summary {{ cursor:pointer; color:#2563eb; font-weight:700; }}
         .retorno-detalhes pre {{ white-space:pre-wrap; overflow-wrap:anywhere; background:#111827; color:#f9fafb; border-radius:8px; padding:10px; margin-top:8px; max-height:240px; overflow:auto; }}
         .table-wrap {{ overflow:auto; }}
+        .toolbar {{ display:flex; justify-content:space-between; gap:12px; align-items:center; flex-wrap:wrap; }}
+        .toolbar .acoes {{ margin-top:0; }}
+        .hint {{ color:#4b5563; font-size:13px; }}
+        .check-cell {{ width:38px; text-align:center; }}
+        .check-cell input {{ width:16px; height:16px; }}
         @media (max-width: 980px) {{ .hero {{ flex-direction:column; }} .hero-meta {{ text-align:left; }} body {{ padding:14px; }} }}
       </style>
+      <script>
+        function toggleGroup(selector, checked) {{
+          document.querySelectorAll(selector).forEach((el) => el.checked = checked);
+        }}
+
+        function submitSelected(formId, checkboxSelector, hiddenId, emptyMessage, confirmMessage) {{
+          const selected = Array.from(document.querySelectorAll(checkboxSelector + ':checked')).map((el) => el.value);
+          if (!selected.length) {{
+            alert(emptyMessage);
+            return false;
+          }}
+          if (!window.confirm(confirmMessage.replace('{{count}}', selected.length))) {{
+            return false;
+          }}
+          document.getElementById(hiddenId).value = selected.join(',');
+          document.getElementById(formId).submit();
+          return false;
+        }}
+      </script>
     </head>
     <body>
       <div class="container">
@@ -1001,6 +1042,21 @@ def render_painel(ordens, servicos, filtros: Optional[dict] = None, msg: str = "
     total_erros = len([o for o in ordens_filtradas if str(o.status_envio or '').startswith('ERRO')])
     total_fotos = len([o for o in ordens_filtradas if fotos_da_ordem(o)])
 
+    datalists = {
+        "id": render_datalist("id", unique_suggestions([o.id for o in ordens])),
+        "numero_os": render_datalist("numero_os", unique_suggestions([o.numero_os for o in ordens])),
+        "servicos": render_datalist("servicos", unique_suggestions([s.codigo_servico for s in servicos])),
+        "codigo_veiculo": render_datalist("codigo_veiculo", unique_suggestions([o.codigo_veiculo for o in ordens] + [s.codigo_veiculo for s in servicos])),
+        "placa": render_datalist("placa", unique_suggestions([o.placa for o in ordens] + [s.placa for s in servicos])),
+        "hodometro": render_datalist("hodometro", unique_suggestions([o.hodometro for o in ordens])),
+        "data_hora_abertura": render_datalist("data_hora_abertura", unique_suggestions([o.data_hora_abertura for o in ordens])),
+        "data_hora_saida": render_datalist("data_hora_saida", unique_suggestions([o.data_hora_saida for o in ordens])),
+        "codigo_filial": render_datalist("codigo_filial", unique_suggestions([o.codigo_filial for o in ordens])),
+        "codigo_departamento": render_datalist("codigo_departamento", unique_suggestions([o.codigo_departamento for o in ordens])),
+        "descricao_defeito": render_datalist("descricao_defeito", unique_suggestions([o.descricao_defeito for o in ordens], limit=40)),
+        "created_at": render_datalist("created_at", unique_suggestions([(o.created_at.strftime('%d/%m/%Y %H:%M') if o.created_at else "") for o in ordens])),
+    }
+
     linhas_os = ""
     for o in ordens_filtradas:
         st = o.status_envio or "PENDENTE"
@@ -1037,6 +1093,7 @@ def render_painel(ordens, servicos, filtros: Optional[dict] = None, msg: str = "
 
         linhas_os += f"""
         <tr>
+          <td class="check-cell"><input type="checkbox" class="ordem-checkbox" value="{o.id}"></td>
           <td><strong>#{o.id}</strong></td>
           <td><span class="{status_class(st)}">{st}</span></td>
           <td>{escape_html(o.numero_os or "—")}</td>
@@ -1070,7 +1127,7 @@ def render_painel(ordens, servicos, filtros: Optional[dict] = None, msg: str = "
             """
         linhas_serv += f"""
         <tr>
-          <td><strong>#{s.id}</strong></td><td><span class="{status_class(st)}">{st}</span></td><td>{escape_html(s.numero_os or '')}</td><td>{escape_html(s.codigo_veiculo or '')}</td><td>{escape_html(s.placa or '')}</td>
+          <td class="check-cell"><input type="checkbox" class="servico-checkbox" value="{s.id}"></td><td><strong>#{s.id}</strong></td><td><span class="{status_class(st)}">{st}</span></td><td>{escape_html(s.numero_os or '')}</td><td>{escape_html(s.codigo_veiculo or '')}</td><td>{escape_html(s.placa or '')}</td>
           <td>{escape_html(s.codigo_servico or '')}</td><td>{escape_html(s.codigo_recurso_humano or '')}</td><td>{escape_html(s.tempo_gasto or '')}</td><td>{escape_html(s.valor_hora or '')}</td>
           <td class="retorno">{retorno_html}</td><td>{s.created_at.strftime('%d/%m/%Y %H:%M') if s.created_at else ''}</td><td>{acao}</td>
         </tr>
@@ -1089,59 +1146,79 @@ def render_painel(ordens, servicos, filtros: Optional[dict] = None, msg: str = "
     </div>
     <div class="card">
       <form method="get" action="/painel/ordens-servico">
+        <div class="hint" style="margin-bottom:12px;">Digite parte do valor e escolha uma sugestão da própria base do painel.</div>
         <div class="filter-grid">
-          <input name="id" placeholder="Filtrar ID Painel" value="{fv('id')}">
+          <input name="id" list="lista-id" placeholder="Filtrar ID Painel" value="{fv('id')}">
           <select name="status_envio">
             <option value="" {"selected" if not filtros.get("status_envio") else ""}>Status: Todos</option>
             <option value="PENDENTE" {"selected" if filtros.get("status_envio") == "PENDENTE" else ""}>Pendente</option>
             <option value="ENVIADA" {"selected" if filtros.get("status_envio") == "ENVIADA" else ""}>Enviada</option>
             <option value="ERRO_ENVIO" {"selected" if filtros.get("status_envio") == "ERRO_ENVIO" else ""}>Erro</option>
           </select>
-          <input name="numero_os" placeholder="Filtrar N? O.S. FrotaWeb" value="{fv('numero_os')}">
-          <input name="servicos" placeholder="Filtrar Servi?os" value="{fv('servicos')}">
-          <input name="codigo_veiculo" placeholder="Filtrar Ve?culo" value="{fv('codigo_veiculo')}">
-          <input name="placa" placeholder="Filtrar Placa" value="{fv('placa')}">
-          <input name="hodometro" placeholder="Filtrar KM" value="{fv('hodometro')}">
-          <input name="data_hora_abertura" placeholder="Filtrar Abertura/Data" value="{fv('data_hora_abertura')}">
-          <input name="data_hora_saida" placeholder="Filtrar Sa?da" value="{fv('data_hora_saida')}">
-          <input name="codigo_filial" placeholder="Filtrar Filial" value="{fv('codigo_filial')}">
-          <input name="codigo_departamento" placeholder="Filtrar Departamento" value="{fv('codigo_departamento')}">
-          <input name="descricao_defeito" placeholder="Filtrar Defeito" value="{fv('descricao_defeito')}">
+          <input name="numero_os" list="lista-numero_os" placeholder="Filtrar Nº O.S. FrotaWeb" value="{fv('numero_os')}">
+          <input name="servicos" list="lista-servicos" placeholder="Filtrar Serviços" value="{fv('servicos')}">
+          <input name="codigo_veiculo" list="lista-codigo_veiculo" placeholder="Filtrar Veículo" value="{fv('codigo_veiculo')}">
+          <input name="placa" list="lista-placa" placeholder="Filtrar Placa" value="{fv('placa')}">
+          <input name="hodometro" list="lista-hodometro" placeholder="Filtrar KM" value="{fv('hodometro')}">
+          <input name="data_hora_abertura" list="lista-data_hora_abertura" placeholder="Filtrar Abertura/Data" value="{fv('data_hora_abertura')}">
+          <input name="data_hora_saida" list="lista-data_hora_saida" placeholder="Filtrar Saída" value="{fv('data_hora_saida')}">
+          <input name="codigo_filial" list="lista-codigo_filial" placeholder="Filtrar Filial" value="{fv('codigo_filial')}">
+          <input name="codigo_departamento" list="lista-codigo_departamento" placeholder="Filtrar Departamento" value="{fv('codigo_departamento')}">
+          <input name="descricao_defeito" list="lista-descricao_defeito" placeholder="Filtrar Defeito" value="{fv('descricao_defeito')}">
           <input name="retorno_envio" placeholder="Buscar no retorno" value="{fv('retorno_envio')}">
-          <input name="created_at" placeholder="Filtrar Criado em" value="{fv('created_at')}">
+          <input name="created_at" list="lista-created_at" placeholder="Filtrar Criado em" value="{fv('created_at')}">
           <select name="fotos">
             <option value="" {"selected" if not filtros.get("fotos") else ""}>Fotos: Todos</option>
             <option value="com_foto" {"selected" if filtros.get("fotos") == "com_foto" else ""}>Somente com foto</option>
           </select>
         </div>
+        {''.join(datalists.values())}
         <div class="acoes">
           <button type="submit">Filtrar</button>
           <a class="btn btn-gray" href="/painel/ordens-servico">Limpar</a>
-          <form method="post" action="/painel/ordens-servico/limpar-cache" onsubmit="return confirm('Limpar toda a fila/cache de O.S. e serviços do painel?');">
-            <button type="submit" class="btn-red">Limpar cache</button>
-          </form>
+          <button type="submit" class="btn-red" formmethod="post" formaction="/painel/ordens-servico/limpar-cache" onclick="return confirm('Limpar toda a fila/cache de O.S. e serviços do painel?');">Limpar cache</button>
           <a class="btn btn-gray" href="/docs">Docs</a>
         </div>
       </form>
     </div>
     <div class="card" style="padding:0;">
       <div style="padding:18px 18px 8px;">
-        <h2 style="margin:0;">Ordens de Serviço</h2>
-        <div class="subtle">A coluna de retorno mostra primeiro a mensagem exata do FrotaWeb e deixa o detalhe tecnico recolhido.</div>
+        <div class="toolbar">
+          <div>
+            <h2 style="margin:0;">Ordens de Serviço</h2>
+            <div class="subtle">A coluna de retorno mostra primeiro a mensagem exata do FrotaWeb e deixa o detalhe tecnico recolhido.</div>
+          </div>
+          <div class="acoes">
+            <form id="bulk-delete-os-form" method="post" action="/painel/ordens-servico/deletar-lote">
+              <input type="hidden" id="bulk-delete-os-ids" name="ids">
+              <button type="button" class="btn-red" onclick="submitSelected('bulk-delete-os-form', '.ordem-checkbox', 'bulk-delete-os-ids', 'Selecione ao menos uma O.S. para excluir.', 'Excluir {{count}} O.S. selecionada(s)?')">Excluir selecionadas</button>
+            </form>
+          </div>
+        </div>
       </div>
       <div class="table-wrap">
-        <table><thead><tr><th>ID Painel</th><th>Status</th><th>Nº O.S. FrotaWeb</th><th>Serviços</th><th>Veículo</th><th>Placa</th><th>KM</th><th>Abertura</th><th>Saída</th><th>Filial</th><th>Departamento</th><th>Defeito</th><th>Fotos</th><th>Retorno</th><th>Criado em</th><th>Ação</th></tr></thead>
-        <tbody>{linhas_os if linhas_os else '<tr><td colspan="16">Nenhuma O.S. encontrada</td></tr>'}</tbody></table>
+        <table><thead><tr><th class="check-cell"><input type="checkbox" onclick="toggleGroup('.ordem-checkbox', this.checked)"></th><th>ID Painel</th><th>Status</th><th>Nº O.S. FrotaWeb</th><th>Serviços</th><th>Veículo</th><th>Placa</th><th>KM</th><th>Abertura</th><th>Saída</th><th>Filial</th><th>Departamento</th><th>Defeito</th><th>Fotos</th><th>Retorno</th><th>Criado em</th><th>Ação</th></tr></thead>
+        <tbody>{linhas_os if linhas_os else '<tr><td colspan="17">Nenhuma O.S. encontrada</td></tr>'}</tbody></table>
       </div>
     </div>
     <div class="card" style="padding:0;">
       <div style="padding:18px 18px 8px;">
-        <h2 style="margin:0;">Serviços da O.S.</h2>
-        <div class="subtle">Serviços com erro mostram a mensagem do FrotaWeb sem expor senha ou payload bruto.</div>
+        <div class="toolbar">
+          <div>
+            <h2 style="margin:0;">Serviços da O.S.</h2>
+            <div class="subtle">Serviços com erro mostram a mensagem do FrotaWeb sem expor senha ou payload bruto.</div>
+          </div>
+          <div class="acoes">
+            <form id="bulk-delete-serv-form" method="post" action="/painel/servicos-os/deletar-lote">
+              <input type="hidden" id="bulk-delete-serv-ids" name="ids">
+              <button type="button" class="btn-red" onclick="submitSelected('bulk-delete-serv-form', '.servico-checkbox', 'bulk-delete-serv-ids', 'Selecione ao menos um serviço para excluir.', 'Excluir {{count}} serviço(s) selecionado(s)?')">Excluir selecionados</button>
+            </form>
+          </div>
+        </div>
       </div>
       <div class="table-wrap">
-        <table><thead><tr><th>ID</th><th>Status</th><th>Nº O.S.</th><th>Veículo</th><th>Placa</th><th>Cód. Serviço</th><th>Recurso</th><th>Tempo</th><th>Valor Hora</th><th>Retorno</th><th>Criado em</th><th>Ação</th></tr></thead>
-        <tbody>{linhas_serv if linhas_serv else '<tr><td colspan="12">Nenhum serviço encontrado</td></tr>'}</tbody></table>
+        <table><thead><tr><th class="check-cell"><input type="checkbox" onclick="toggleGroup('.servico-checkbox', this.checked)"></th><th>ID</th><th>Status</th><th>Nº O.S.</th><th>Veículo</th><th>Placa</th><th>Cód. Serviço</th><th>Recurso</th><th>Tempo</th><th>Valor Hora</th><th>Retorno</th><th>Criado em</th><th>Ação</th></tr></thead>
+        <tbody>{linhas_serv if linhas_serv else '<tr><td colspan="13">Nenhum serviço encontrado</td></tr>'}</tbody></table>
       </div>
     </div>
     """
@@ -1401,6 +1478,56 @@ def deletar_ordem(ordem_id: int, db: Session = Depends(get_db)):
 
     db.commit()
     return RedirectResponse(url="/painel/ordens-servico?msg=O.S.%20deletada%20com%20sucesso", status_code=303)
+
+
+def parse_ids_lote(ids_texto: str) -> list[int]:
+    ids: list[int] = []
+    for parte in str(ids_texto or "").split(","):
+        parte = parte.strip()
+        if not parte:
+            continue
+        try:
+            ids.append(int(parte))
+        except ValueError:
+            continue
+    return ids
+
+
+@app.post("/painel/ordens-servico/deletar-lote")
+async def deletar_ordens_lote(request: Request, db: Session = Depends(get_db)):
+    form = await request.form()
+    ids = parse_ids_lote(form.get("ids"))
+    if not ids:
+        return RedirectResponse(url="/painel/ordens-servico?msg=Nenhuma%20O.S.%20selecionada%20para%20exclusao", status_code=303)
+
+    ordens = db.query(OrdemServico).filter(OrdemServico.id.in_(ids)).filter(OrdemServico.deleted_at.is_(None)).all()
+    ordem_ids_str = {str(o.id) for o in ordens}
+    numeros_os = {str(o.numero_os or "") for o in ordens if o.numero_os}
+    for ordem in ordens:
+        ordem.deleted_at = func.now()
+
+    servicos = db.query(ServicoOS).filter(ServicoOS.deleted_at.is_(None)).all()
+    for serv in servicos:
+        if str(serv.numero_os or "") in ordem_ids_str or str(serv.numero_os or "") in numeros_os:
+            serv.deleted_at = func.now()
+
+    db.commit()
+    return RedirectResponse(url=f"/painel/ordens-servico?msg={len(ordens)}%20O.S.%20excluida(s)%20em%20lote", status_code=303)
+
+
+@app.post("/painel/servicos-os/deletar-lote")
+async def deletar_servicos_lote(request: Request, db: Session = Depends(get_db)):
+    form = await request.form()
+    ids = parse_ids_lote(form.get("ids"))
+    if not ids:
+        return RedirectResponse(url="/painel/ordens-servico?msg=Nenhum%20servico%20selecionado%20para%20exclusao", status_code=303)
+
+    servicos = db.query(ServicoOS).filter(ServicoOS.id.in_(ids)).filter(ServicoOS.deleted_at.is_(None)).all()
+    for serv in servicos:
+        serv.deleted_at = func.now()
+
+    db.commit()
+    return RedirectResponse(url=f"/painel/ordens-servico?msg={len(servicos)}%20servico(s)%20excluido(s)%20em%20lote", status_code=303)
 
 
 @app.post("/painel/ordens-servico/limpar-cache")
