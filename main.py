@@ -45,6 +45,7 @@ FROTAWEB_RECURSO_HUMANO = os.getenv("FROTAWEB_RECURSO_HUMANO", "")
 HTTP_VERIFY_TLS = str(os.getenv("HTTP_VERIFY_TLS", "false")).strip().lower() in ("1", "true", "yes", "on")
 HTTP_MAX_RETRIES = max(1, int(os.getenv("HTTP_MAX_RETRIES", "3")))
 HTTP_RETRY_BACKOFF_SECONDS = max(1, int(os.getenv("HTTP_RETRY_BACKOFF_SECONDS", "2")))
+HTTP_RETRYABLE_STATUS_CODES = {429, 502, 503, 504}
 
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -514,19 +515,26 @@ def post_json(url: str, payload: dict) -> dict:
             time.sleep(HTTP_RETRY_BACKOFF_SECONDS * tentativa)
             continue
 
-        if resp.status_code != 429:
+        if resp.status_code not in HTTP_RETRYABLE_STATUS_CODES:
             break
 
-        retry_after_header = str(resp.headers.get("Retry-After") or "").strip()
-        try:
-            retry_after = max(1, int(retry_after_header))
-        except Exception:
-            retry_after = HTTP_RETRY_BACKOFF_SECONDS * tentativa
+        retry_after = HTTP_RETRY_BACKOFF_SECONDS * tentativa
+        if resp.status_code == 429:
+            retry_after_header = str(resp.headers.get("Retry-After") or "").strip()
+            try:
+                retry_after = max(1, int(retry_after_header))
+            except Exception:
+                retry_after = HTTP_RETRY_BACKOFF_SECONDS * tentativa
 
         if tentativa >= HTTP_MAX_RETRIES:
             break
 
-        logger.warning("Recebido 429 ao enviar para %s; aguardando %ss antes da nova tentativa", url, retry_after)
+        logger.warning(
+            "Recebido %s ao enviar para %s; aguardando %ss antes da nova tentativa",
+            resp.status_code,
+            url,
+            retry_after,
+        )
         time.sleep(retry_after)
 
     if resp is None:
@@ -544,6 +552,15 @@ def post_json(url: str, payload: dict) -> dict:
                 detail={
                     "url": url,
                     "mensagem_frotaweb": "Too Many Requests. O painel tentou novamente, mas a API ainda estava limitando as requisicoes. Aguarde alguns segundos e reenvie.",
+                    "retorno": mascarar_senha(retorno),
+                },
+            )
+        if resp.status_code in {502, 503, 504}:
+            raise HTTPException(
+                status_code=resp.status_code,
+                detail={
+                    "url": url,
+                    "mensagem_frotaweb": "A integracao ficou indisponivel temporariamente. O painel tentou novamente, mas o servico continuou retornando erro de gateway. Aguarde alguns segundos e reenvie.",
                     "retorno": mascarar_senha(retorno),
                 },
             )
