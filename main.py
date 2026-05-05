@@ -43,9 +43,11 @@ FROTAWEB_SENHA = os.getenv("FROTAWEB_SENHA", "")
 FROTAWEB_FILIAL = os.getenv("FROTAWEB_FILIAL", "1")
 FROTAWEB_RECURSO_HUMANO = os.getenv("FROTAWEB_RECURSO_HUMANO", "")
 HTTP_VERIFY_TLS = str(os.getenv("HTTP_VERIFY_TLS", "false")).strip().lower() in ("1", "true", "yes", "on")
-HTTP_MAX_RETRIES = max(1, int(os.getenv("HTTP_MAX_RETRIES", "3")))
-HTTP_RETRY_BACKOFF_SECONDS = max(1, int(os.getenv("HTTP_RETRY_BACKOFF_SECONDS", "2")))
+HTTP_MAX_RETRIES = max(1, int(os.getenv("HTTP_MAX_RETRIES", "4")))
+HTTP_RETRY_BACKOFF_SECONDS = max(1, int(os.getenv("HTTP_RETRY_BACKOFF_SECONDS", "5")))
 HTTP_RETRYABLE_STATUS_CODES = {429, 502, 503, 504}
+HTTP_WAKEUP_ENABLED = str(os.getenv("HTTP_WAKEUP_ENABLED", "true")).strip().lower() in ("1", "true", "yes", "on")
+HTTP_WAKEUP_DELAY_SECONDS = max(1, int(os.getenv("HTTP_WAKEUP_DELAY_SECONDS", "3")))
 
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -503,18 +505,44 @@ def payload_servico_from_model(s: ServicoOS) -> dict:
 
 
 def post_json(url: str, payload: dict) -> dict:
+    diagnostics: dict[str, Any] = {
+        "url": url,
+        "tentativas": 0,
+        "status_http": None,
+        "wakeup_executado": False,
+    }
+    if HTTP_WAKEUP_ENABLED:
+        health_url = url.rsplit("/", 1)[0] + "/health"
+        diagnostics["wakeup_executado"] = True
+        diagnostics["health_url"] = health_url
+        try:
+            requests.get(health_url, timeout=30, verify=HTTP_VERIFY_TLS)
+            time.sleep(HTTP_WAKEUP_DELAY_SECONDS)
+        except Exception as exc:
+            diagnostics["wakeup_erro"] = str(exc)
+
     resp = None
     last_error = None
     for tentativa in range(1, HTTP_MAX_RETRIES + 1):
+        diagnostics["tentativas"] = tentativa
         try:
             resp = requests.post(url, json=payload, timeout=120, verify=HTTP_VERIFY_TLS)
         except Exception as exc:
             last_error = exc
+            diagnostics["ultimo_erro_conexao"] = str(exc)
             if tentativa >= HTTP_MAX_RETRIES:
-                raise HTTPException(status_code=500, detail=f"Erro ao conectar: {str(exc)}")
+                raise HTTPException(
+                    status_code=500,
+                    detail={
+                        "url": url,
+                        "mensagem_frotaweb": f"Erro ao conectar na integracao apos {tentativa} tentativa(s): {str(exc)}",
+                        "diagnostico": diagnostics,
+                    },
+                )
             time.sleep(HTTP_RETRY_BACKOFF_SECONDS * tentativa)
             continue
 
+        diagnostics["status_http"] = resp.status_code
         if resp.status_code not in HTTP_RETRYABLE_STATUS_CODES:
             break
 
@@ -529,6 +557,7 @@ def post_json(url: str, payload: dict) -> dict:
         if tentativa >= HTTP_MAX_RETRIES:
             break
 
+        diagnostics["ultima_espera_segundos"] = retry_after
         logger.warning(
             "Recebido %s ao enviar para %s; aguardando %ss antes da nova tentativa",
             resp.status_code,
@@ -538,7 +567,14 @@ def post_json(url: str, payload: dict) -> dict:
         time.sleep(retry_after)
 
     if resp is None:
-        raise HTTPException(status_code=500, detail=f"Erro ao conectar: {str(last_error)}")
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "url": url,
+                "mensagem_frotaweb": f"Erro ao conectar: {str(last_error)}",
+                "diagnostico": diagnostics,
+            },
+        )
 
     try:
         retorno = resp.json()
@@ -553,6 +589,7 @@ def post_json(url: str, payload: dict) -> dict:
                     "url": url,
                     "mensagem_frotaweb": "Too Many Requests. O painel tentou novamente, mas a API ainda estava limitando as requisicoes. Aguarde alguns segundos e reenvie.",
                     "retorno": mascarar_senha(retorno),
+                    "diagnostico": diagnostics,
                 },
             )
         if resp.status_code in {502, 503, 504}:
@@ -562,6 +599,7 @@ def post_json(url: str, payload: dict) -> dict:
                     "url": url,
                     "mensagem_frotaweb": "A integracao ficou indisponivel temporariamente. O painel tentou novamente, mas o servico continuou retornando erro de gateway. Aguarde alguns segundos e reenvie.",
                     "retorno": mascarar_senha(retorno),
+                    "diagnostico": diagnostics,
                 },
             )
         raise HTTPException(
@@ -570,6 +608,7 @@ def post_json(url: str, payload: dict) -> dict:
                 "url": url,
                 "mensagem_frotaweb": mensagem_frotaweb(retorno),
                 "retorno": mascarar_senha(retorno),
+                "diagnostico": diagnostics,
             },
         )
 
