@@ -990,10 +990,10 @@ def render_painel(ordens, servicos, filtros: Optional[dict] = None, msg: str = "
         ]
         servicos_por_ordem[ordem.id] = relacionados
 
-    filtros["_servicos_texto"] = {{
+    filtros["_servicos_texto"] = {
         ordem_id: " ".join([str(s.codigo_servico or "") for s in lista])
         for ordem_id, lista in servicos_por_ordem.items()
-    }}
+    }
 
     ordens_filtradas = filtrar_ordens(ordens, filtros)
 
@@ -1023,7 +1023,7 @@ def render_painel(ordens, servicos, filtros: Optional[dict] = None, msg: str = "
         acoes = f"""
         <div class="acoes-coluna">
           <a class="btn btn-blue" href="/painel/ordens-servico/editar/{o.id}">Editar</a>
-          <form method="post" action="/painel/ordens-servico/deletar/{o.id}" onsubmit="return confirm('Deletar a O.S. {o.id}? Esta a??o remove a O.S. do painel.');">
+          <form method="post" action="/painel/ordens-servico/deletar/{o.id}" onsubmit="return confirm('Deletar a O.S. {o.id}? Esta ação remove a O.S. do painel.');">
             <button class="btn-red" type="submit">Deletar</button>
           </form>
         """
@@ -1032,7 +1032,7 @@ def render_painel(ordens, servicos, filtros: Optional[dict] = None, msg: str = "
         else:
             acoes += f"""
             <form method="post" action="/painel/ordens-servico/enviar/{o.id}" onsubmit="return confirm('Enviar O.S. {o.id} ao FrotaWeb?')">
-              <button class="btn-green" type="submit">Enviar O.S. + Servi?os</button>
+              <button class="btn-green" type="submit">Enviar O.S. + Serviços</button>
             </form>
             """
         acoes += "</div>"
@@ -1041,7 +1041,7 @@ def render_painel(ordens, servicos, filtros: Optional[dict] = None, msg: str = "
         <tr>
           <td><strong>#{o.id}</strong></td>
           <td><span class="{status_class(st)}">{st}</span></td>
-          <td>{escape_html(o.numero_os or "?")}</td>
+          <td>{escape_html(o.numero_os or "—")}</td>
           <td>{escape_html(servico_resumo)}</td>
           <td>{escape_html(o.codigo_veiculo or "")}</td>
           <td>{escape_html(o.placa or "")}</td>
@@ -1066,8 +1066,8 @@ def render_painel(ordens, servicos, filtros: Optional[dict] = None, msg: str = "
             acao = "<span class='status-enviada'>Enviado</span>"
         else:
             acao = f"""
-            <form method="post" action="/painel/servicos-os/enviar/{s.id}" onsubmit="return confirm('Enviar servi?o {s.id} ao FrotaWeb?')">
-              <button class="btn-green" type="submit">Enviar Servi?o</button>
+            <form method="post" action="/painel/servicos-os/enviar/{s.id}" onsubmit="return confirm('Enviar serviço {s.id} ao FrotaWeb?')">
+              <button class="btn-green" type="submit">Enviar Serviço</button>
             </form>
             """
         linhas_serv += f"""
@@ -1125,22 +1125,22 @@ def render_painel(ordens, servicos, filtros: Optional[dict] = None, msg: str = "
     </div>
     <div class="card" style="padding:0;">
       <div style="padding:18px 18px 8px;">
-        <h2 style="margin:0;">Ordens de Servi?o</h2>
+        <h2 style="margin:0;">Ordens de Serviço</h2>
         <div class="subtle">A coluna de retorno mostra primeiro a mensagem exata do FrotaWeb e deixa o detalhe tecnico recolhido.</div>
       </div>
       <div class="table-wrap">
-        <table><thead><tr><th>ID Painel</th><th>Status</th><th>N? O.S. FrotaWeb</th><th>Servi?os</th><th>Ve?culo</th><th>Placa</th><th>KM</th><th>Abertura</th><th>Sa?da</th><th>Filial</th><th>Departamento</th><th>Defeito</th><th>Fotos</th><th>Retorno</th><th>Criado em</th><th>A??o</th></tr></thead>
+        <table><thead><tr><th>ID Painel</th><th>Status</th><th>Nº O.S. FrotaWeb</th><th>Serviços</th><th>Veículo</th><th>Placa</th><th>KM</th><th>Abertura</th><th>Saída</th><th>Filial</th><th>Departamento</th><th>Defeito</th><th>Fotos</th><th>Retorno</th><th>Criado em</th><th>Ação</th></tr></thead>
         <tbody>{linhas_os if linhas_os else '<tr><td colspan="16">Nenhuma O.S. encontrada</td></tr>'}</tbody></table>
       </div>
     </div>
     <div class="card" style="padding:0;">
       <div style="padding:18px 18px 8px;">
-        <h2 style="margin:0;">Servi?os da O.S.</h2>
-        <div class="subtle">Servi?os com erro mostram a mensagem do FrotaWeb sem expor senha ou payload bruto.</div>
+        <h2 style="margin:0;">Serviços da O.S.</h2>
+        <div class="subtle">Serviços com erro mostram a mensagem do FrotaWeb sem expor senha ou payload bruto.</div>
       </div>
       <div class="table-wrap">
-        <table><thead><tr><th>ID</th><th>Status</th><th>N? O.S.</th><th>Ve?culo</th><th>Placa</th><th>C?d. Servi?o</th><th>Recurso</th><th>Tempo</th><th>Valor Hora</th><th>Retorno</th><th>Criado em</th><th>A??o</th></tr></thead>
-        <tbody>{linhas_serv if linhas_serv else '<tr><td colspan="12">Nenhum servi?o encontrado</td></tr>'}</tbody></table>
+        <table><thead><tr><th>ID</th><th>Status</th><th>Nº O.S.</th><th>Veículo</th><th>Placa</th><th>Cód. Serviço</th><th>Recurso</th><th>Tempo</th><th>Valor Hora</th><th>Retorno</th><th>Criado em</th><th>Ação</th></tr></thead>
+        <tbody>{linhas_serv if linhas_serv else '<tr><td colspan="12">Nenhum serviço encontrado</td></tr>'}</tbody></table>
       </div>
     </div>
     """
