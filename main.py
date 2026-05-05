@@ -477,7 +477,14 @@ def post_json(url: str, payload: dict) -> dict:
         retorno = {"raw": resp.text}
 
     if resp.status_code not in (200, 201):
-        raise HTTPException(status_code=resp.status_code, detail={"url": url, "payload_enviado": payload, "retorno": retorno})
+        raise HTTPException(
+            status_code=resp.status_code,
+            detail={
+                "url": url,
+                "mensagem_frotaweb": mensagem_frotaweb(retorno),
+                "retorno": mascarar_senha(retorno),
+            },
+        )
 
     return retorno
 
@@ -575,13 +582,19 @@ def enviar_servicos_relacionados(db: Session, ordem: OrdemServico, numero_os_fro
 
         try:
             retorno_serv = post_json(FROTAWEB_SERVICO_URL, payload_serv)
-            serv.status_envio = "ENVIADA"
-            serv.retorno_envio = str(retorno_serv)
-            enviados_agora += 1
-            detalhes.append(f"servico_id={serv.id}: ENVIADO")
+            if resposta_criada_com_sucesso(retorno_serv):
+                serv.status_envio = "ENVIADA"
+                serv.retorno_envio = mensagem_frotaweb(retorno_serv, "Serviço enviado com sucesso.")
+                enviados_agora += 1
+                detalhes.append(f"servico_id={serv.id}: ENVIADO")
+            else:
+                serv.status_envio = "ERRO_ENVIO"
+                serv.retorno_envio = mensagem_frotaweb(retorno_serv)
+                erros_agora += 1
+                detalhes.append(f"servico_id={serv.id}: ERRO")
         except HTTPException as exc:
             serv.status_envio = "ERRO_ENVIO"
-            serv.retorno_envio = str(exc.detail)
+            serv.retorno_envio = mensagem_frotaweb(exc.detail)
             erros_agora += 1
             detalhes.append(f"servico_id={serv.id}: ERRO")
 
@@ -650,6 +663,56 @@ def json_loads_safe(value: str, default: Any = None) -> Any:
         return json.loads(value or "")
     except Exception:
         return default
+
+
+def flatten_messages(value: Any) -> list[str]:
+    mensagens: list[str] = []
+    if isinstance(value, dict):
+        for chave in ("message", "detail", "erro", "error"):
+            conteudo = value.get(chave)
+            if isinstance(conteudo, str) and conteudo.strip():
+                mensagens.append(conteudo.strip())
+            elif conteudo not in (None, "", [], {}):
+                mensagens.extend(flatten_messages(conteudo))
+        retorno = value.get("retorno")
+        if retorno not in (None, "", [], {}):
+            mensagens.extend(flatten_messages(retorno))
+        raw = value.get("raw")
+        if isinstance(raw, str) and raw.strip():
+            mensagens.append(raw.strip())
+    elif isinstance(value, list):
+        for item in value:
+            mensagens.extend(flatten_messages(item))
+    elif isinstance(value, str) and value.strip():
+        mensagens.append(value.strip())
+    # preserva ordem, remove repetidos
+    return list(dict.fromkeys(mensagens))
+
+
+def mensagem_frotaweb(value: Any, fallback: str = "Erro ao enviar ao FrotaWeb.") -> str:
+    mensagens = flatten_messages(value)
+    if not mensagens:
+        return fallback
+    return " | ".join(mensagens)
+
+
+def resposta_criada_com_sucesso(retorno: Any) -> bool:
+    if isinstance(retorno, dict) and "created" in retorno:
+        return bool(retorno.get("created"))
+    return True
+
+
+def retorno_resumido_html(value: Any, success: bool = False) -> str:
+    resumo = escape_html(mensagem_frotaweb(value, "Sem retorno"))
+    detalhes_obj = mascarar_senha(value)
+    detalhes = escape_html(json_dumps_safe(detalhes_obj))
+    css = "retorno-ok" if success else "retorno-erro"
+    return (
+        f"<div class='retorno-bloco {css}'>"
+        f"<div class='retorno-resumo'>{resumo}</div>"
+        f"<details class='retorno-detalhes'><summary>Ver detalhes</summary><pre>{detalhes}</pre></details>"
+        f"</div>"
+    )
 
 
 def limpar_base64(data_base64: str) -> str:
@@ -851,26 +914,59 @@ def html_base(titulo: str, corpo: str, msg: str = "") -> str:
       <style>
         body {{ font-family: Arial, sans-serif; background:#f3f4f6; margin:0; padding:24px; color:#111827; }}
         .container {{ max-width:1700px; margin:0 auto; }}
+        .hero {{ display:flex; justify-content:space-between; gap:18px; align-items:flex-start; margin-bottom:18px; }}
+        .hero-copy h1 {{ margin:0 0 6px; font-size:28px; }}
+        .hero-copy p {{ margin:0; color:#4b5563; font-size:15px; }}
+        .hero-meta {{ text-align:right; color:#6b7280; font-size:12px; }}
         .card {{ background:white; border-radius:14px; padding:18px; box-shadow:0 2px 12px rgba(0,0,0,.08); margin-bottom:18px; }}
+        .kpis {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:12px; margin-bottom:18px; }}
+        .kpi {{ background:white; border-radius:14px; padding:16px; box-shadow:0 2px 12px rgba(0,0,0,.06); border:1px solid #e5e7eb; }}
+        .kpi .label {{ color:#6b7280; font-size:12px; text-transform:uppercase; letter-spacing:.04em; }}
+        .kpi .value {{ font-size:28px; font-weight:800; margin-top:8px; }}
         .grid {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:12px; align-items:end; }}
+        .filter-grid {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(170px,1fr)); gap:12px; align-items:end; }}
         label {{ display:block; font-weight:700; margin-bottom:6px; color:#374151; font-size:14px; }}
         input, select {{ width:100%; box-sizing:border-box; padding:10px; border:1px solid #d1d5db; border-radius:8px; }}
-        button, .btn {{ background:#2563eb; color:white; border:0; border-radius:8px; padding:10px 14px; cursor:pointer; text-decoration:none; display:inline-block; font-size:14px; }}
-        .btn-green {{ background:#059669; }} .btn-gray {{ background:#4b5563; }} .btn-orange {{ background:#ea580c; }}
+        button, .btn {{ background:#2563eb; color:white; border:0; border-radius:8px; padding:10px 14px; cursor:pointer; text-decoration:none; display:inline-block; font-size:14px; font-weight:700; }}
+        .btn-green {{ background:#059669; }} .btn-gray {{ background:#4b5563; }} .btn-orange {{ background:#ea580c; }} .btn-red {{ background:#dc2626; }} .btn-blue {{ background:#2563eb; }}
         .acoes {{ display:flex; gap:8px; flex-wrap:wrap; margin-top:14px; }}
+        .acoes-coluna {{ display:flex; flex-direction:column; gap:10px; min-width:182px; }}
+        .acoes-coluna form, .acoes-coluna a, .acoes-coluna button {{ width:100%; }}
         table {{ width:100%; border-collapse:collapse; background:white; }}
         th, td {{ padding:10px; border-bottom:1px solid #e5e7eb; text-align:left; vertical-align:top; font-size:13px; }}
-        th {{ background:#111827; color:white; }}
+        th {{ background:#111827; color:white; position:sticky; top:0; }}
         tr:hover {{ background:#f9fafb; }}
         .msg {{ background:#ecfdf5; color:#065f46; padding:12px; border-radius:8px; margin-bottom:14px; font-weight:700; }}
-        .status-pendente {{ color:#b45309; font-weight:800; }} .status-enviada {{ color:#047857; font-weight:800; }} .status-erro {{ color:#b91c1c; font-weight:800; }}
-        .small {{ color:#6b7280; font-size:12px; }} .retorno {{ max-width:260px; white-space:normal; overflow-wrap:anywhere; }}
+        .status-pendente, .status-enviada, .status-erro {{ display:inline-flex; align-items:center; border-radius:999px; padding:6px 10px; font-weight:800; font-size:12px; }}
+        .status-pendente {{ color:#92400e; background:#fffbeb; }}
+        .status-enviada {{ color:#065f46; background:#ecfdf5; }}
+        .status-erro {{ color:#991b1b; background:#fef2f2; }}
+        .small {{ color:#6b7280; font-size:12px; }}
+        .subtle {{ color:#6b7280; font-size:13px; }}
+        .retorno {{ min-width:320px; max-width:420px; white-space:normal; overflow-wrap:anywhere; }}
+        .retorno-bloco {{ border:1px solid #e5e7eb; border-radius:10px; padding:10px 12px; background:#fff; }}
+        .retorno-ok {{ border-left:4px solid #059669; }}
+        .retorno-erro {{ border-left:4px solid #dc2626; }}
+        .retorno-resumo {{ font-weight:700; line-height:1.45; }}
+        .retorno-detalhes {{ margin-top:8px; }}
+        .retorno-detalhes summary {{ cursor:pointer; color:#2563eb; font-weight:700; }}
+        .retorno-detalhes pre {{ white-space:pre-wrap; overflow-wrap:anywhere; background:#111827; color:#f9fafb; border-radius:8px; padding:10px; margin-top:8px; max-height:240px; overflow:auto; }}
+        .table-wrap {{ overflow:auto; }}
+        @media (max-width: 980px) {{ .hero {{ flex-direction:column; }} .hero-meta {{ text-align:left; }} body {{ padding:14px; }} }}
       </style>
     </head>
     <body>
       <div class="container">
-        <h1>{titulo}</h1>
-        <div class="small">O.S.: {FROTAWEB_OS_URL} | Serviços: {FROTAWEB_SERVICO_URL}</div>
+        <div class="hero">
+          <div class="hero-copy">
+            <h1>{titulo}</h1>
+            <p>Receba os lancamentos do app, acompanhe a fila e enxergue o retorno exato do FrotaWeb sem ruido tecnico.</p>
+          </div>
+          <div class="hero-meta">
+            <div>O.S.: {FROTAWEB_OS_URL}</div>
+            <div>Servicos: {FROTAWEB_SERVICO_URL}</div>
+          </div>
+        </div>
         {f'<div class="msg">{msg}</div>' if msg else ''}
         {corpo}
       </div>
@@ -894,19 +990,23 @@ def render_painel(ordens, servicos, filtros: Optional[dict] = None, msg: str = "
         ]
         servicos_por_ordem[ordem.id] = relacionados
 
-    filtros["_servicos_texto"] = {
+    filtros["_servicos_texto"] = {{
         ordem_id: " ".join([str(s.codigo_servico or "") for s in lista])
         for ordem_id, lista in servicos_por_ordem.items()
-    }
+    }}
 
     ordens_filtradas = filtrar_ordens(ordens, filtros)
+
+    total_os = len(ordens_filtradas)
+    total_pendentes = len([o for o in ordens_filtradas if (o.status_envio or 'PENDENTE') == 'PENDENTE'])
+    total_enviadas = len([o for o in ordens_filtradas if (o.status_envio or '') == 'ENVIADA'])
+    total_erros = len([o for o in ordens_filtradas if str(o.status_envio or '').startswith('ERRO')])
+    total_fotos = len([o for o in ordens_filtradas if fotos_da_ordem(o)])
 
     linhas_os = ""
     for o in ordens_filtradas:
         st = o.status_envio or "PENDENTE"
-        ret = (o.retorno_envio or "")
-        if len(ret) > 220:
-            ret = ret[:220] + "..."
+        retorno_html = retorno_resumido_html(o.retorno_envio or "", success=st == "ENVIADA")
 
         serv_rel = servicos_por_ordem.get(o.id, [])
         total_serv = len(serv_rel)
@@ -921,9 +1021,9 @@ def render_painel(ordens, servicos, filtros: Optional[dict] = None, msg: str = "
             servico_resumo += f" | {pend_serv} pendente(s)"
 
         acoes = f"""
-        <div class="acoes">
+        <div class="acoes-coluna">
           <a class="btn btn-blue" href="/painel/ordens-servico/editar/{o.id}">Editar</a>
-          <form method="post" action="/painel/ordens-servico/deletar/{o.id}" onsubmit="return confirm('Deletar a O.S. {o.id}? Esta ação remove a O.S. do painel.');">
+          <form method="post" action="/painel/ordens-servico/deletar/{o.id}" onsubmit="return confirm('Deletar a O.S. {o.id}? Esta a??o remove a O.S. do painel.');">
             <button class="btn-red" type="submit">Deletar</button>
           </form>
         """
@@ -932,16 +1032,16 @@ def render_painel(ordens, servicos, filtros: Optional[dict] = None, msg: str = "
         else:
             acoes += f"""
             <form method="post" action="/painel/ordens-servico/enviar/{o.id}" onsubmit="return confirm('Enviar O.S. {o.id} ao FrotaWeb?')">
-              <button class="btn-green" type="submit">Enviar O.S. + Serviços</button>
+              <button class="btn-green" type="submit">Enviar O.S. + Servi?os</button>
             </form>
             """
         acoes += "</div>"
 
         linhas_os += f"""
         <tr>
-          <td>{o.id}</td>
+          <td><strong>#{o.id}</strong></td>
           <td><span class="{status_class(st)}">{st}</span></td>
-          <td>{escape_html(o.numero_os or "")}</td>
+          <td>{escape_html(o.numero_os or "?")}</td>
           <td>{escape_html(servico_resumo)}</td>
           <td>{escape_html(o.codigo_veiculo or "")}</td>
           <td>{escape_html(o.placa or "")}</td>
@@ -952,8 +1052,8 @@ def render_painel(ordens, servicos, filtros: Optional[dict] = None, msg: str = "
           <td>{escape_html(o.codigo_departamento or "")}</td>
           <td>{escape_html(o.descricao_defeito or "")}</td>
           <td>{html_fotos_ordem(o)}</td>
-          <td class="retorno">{escape_html(ret)}</td>
-          <td>{o.created_at.strftime("%d/%m/%Y %H:%M") if o.created_at else ""}</td>
+          <td class="retorno">{retorno_html}</td>
+          <td>{o.created_at.strftime('%d/%m/%Y %H:%M') if o.created_at else ''}</td>
           <td>{acoes}</td>
         </tr>
         """
@@ -961,22 +1061,20 @@ def render_painel(ordens, servicos, filtros: Optional[dict] = None, msg: str = "
     linhas_serv = ""
     for s in servicos:
         st = s.status_envio or "PENDENTE"
-        ret = (s.retorno_envio or "")
-        if len(ret) > 200:
-            ret = ret[:200] + "..."
+        retorno_html = retorno_resumido_html(s.retorno_envio or "", success=st == "ENVIADA")
         if st == "ENVIADA":
             acao = "<span class='status-enviada'>Enviado</span>"
         else:
             acao = f"""
-            <form method="post" action="/painel/servicos-os/enviar/{s.id}" onsubmit="return confirm('Enviar serviço {s.id} ao FrotaWeb?')">
-              <button class="btn-green" type="submit">Enviar Serviço</button>
+            <form method="post" action="/painel/servicos-os/enviar/{s.id}" onsubmit="return confirm('Enviar servi?o {s.id} ao FrotaWeb?')">
+              <button class="btn-green" type="submit">Enviar Servi?o</button>
             </form>
             """
         linhas_serv += f"""
         <tr>
-          <td>{s.id}</td><td><span class="{status_class(st)}">{st}</span></td><td>{escape_html(s.numero_os or "")}</td><td>{escape_html(s.codigo_veiculo or "")}</td><td>{escape_html(s.placa or "")}</td>
-          <td>{escape_html(s.codigo_servico or "")}</td><td>{escape_html(s.codigo_recurso_humano or "")}</td><td>{escape_html(s.tempo_gasto or "")}</td><td>{escape_html(s.valor_hora or "")}</td>
-          <td class="retorno">{escape_html(ret)}</td><td>{s.created_at.strftime("%d/%m/%Y %H:%M") if s.created_at else ""}</td><td>{acao}</td>
+          <td><strong>#{s.id}</strong></td><td><span class="{status_class(st)}">{st}</span></td><td>{escape_html(s.numero_os or '')}</td><td>{escape_html(s.codigo_veiculo or '')}</td><td>{escape_html(s.placa or '')}</td>
+          <td>{escape_html(s.codigo_servico or '')}</td><td>{escape_html(s.codigo_recurso_humano or '')}</td><td>{escape_html(s.tempo_gasto or '')}</td><td>{escape_html(s.valor_hora or '')}</td>
+          <td class="retorno">{retorno_html}</td><td>{s.created_at.strftime('%d/%m/%Y %H:%M') if s.created_at else ''}</td><td>{acao}</td>
         </tr>
         """
 
@@ -984,6 +1082,13 @@ def render_painel(ordens, servicos, filtros: Optional[dict] = None, msg: str = "
         return escape_html(filtros.get(nome, "") or "")
 
     corpo = f"""
+    <div class="kpis">
+      <div class="kpi"><div class="label">Ordens visiveis</div><div class="value">{total_os}</div></div>
+      <div class="kpi"><div class="label">Pendentes</div><div class="value">{total_pendentes}</div></div>
+      <div class="kpi"><div class="label">Enviadas</div><div class="value">{total_enviadas}</div></div>
+      <div class="kpi"><div class="label">Com erro</div><div class="value">{total_erros}</div></div>
+      <div class="kpi"><div class="label">Com foto</div><div class="value">{total_fotos}</div></div>
+    </div>
     <div class="card">
       <form method="get" action="/painel/ordens-servico">
         <div class="filter-grid">
@@ -994,17 +1099,17 @@ def render_painel(ordens, servicos, filtros: Optional[dict] = None, msg: str = "
             <option value="ENVIADA" {"selected" if filtros.get("status_envio") == "ENVIADA" else ""}>Enviada</option>
             <option value="ERRO_ENVIO" {"selected" if filtros.get("status_envio") == "ERRO_ENVIO" else ""}>Erro</option>
           </select>
-          <input name="numero_os" placeholder="Filtrar Nº O.S. FrotaWeb" value="{fv('numero_os')}">
-          <input name="servicos" placeholder="Filtrar Serviços" value="{fv('servicos')}">
-          <input name="codigo_veiculo" placeholder="Filtrar Veículo" value="{fv('codigo_veiculo')}">
+          <input name="numero_os" placeholder="Filtrar N? O.S. FrotaWeb" value="{fv('numero_os')}">
+          <input name="servicos" placeholder="Filtrar Servi?os" value="{fv('servicos')}">
+          <input name="codigo_veiculo" placeholder="Filtrar Ve?culo" value="{fv('codigo_veiculo')}">
           <input name="placa" placeholder="Filtrar Placa" value="{fv('placa')}">
           <input name="hodometro" placeholder="Filtrar KM" value="{fv('hodometro')}">
           <input name="data_hora_abertura" placeholder="Filtrar Abertura/Data" value="{fv('data_hora_abertura')}">
-          <input name="data_hora_saida" placeholder="Filtrar Saída" value="{fv('data_hora_saida')}">
+          <input name="data_hora_saida" placeholder="Filtrar Sa?da" value="{fv('data_hora_saida')}">
           <input name="codigo_filial" placeholder="Filtrar Filial" value="{fv('codigo_filial')}">
           <input name="codigo_departamento" placeholder="Filtrar Departamento" value="{fv('codigo_departamento')}">
           <input name="descricao_defeito" placeholder="Filtrar Defeito" value="{fv('descricao_defeito')}">
-          <input name="retorno_envio" placeholder="Filtrar Retorno" value="{fv('retorno_envio')}">
+          <input name="retorno_envio" placeholder="Buscar no retorno" value="{fv('retorno_envio')}">
           <input name="created_at" placeholder="Filtrar Criado em" value="{fv('created_at')}">
           <select name="fotos">
             <option value="" {"selected" if not filtros.get("fotos") else ""}>Fotos: Todos</option>
@@ -1018,15 +1123,25 @@ def render_painel(ordens, servicos, filtros: Optional[dict] = None, msg: str = "
         </div>
       </form>
     </div>
-    <div class="card" style="padding:0; overflow:auto;">
-      <h2 style="padding:18px; margin:0;">Ordens de Serviço</h2>
-      <table><thead><tr><th>ID Painel</th><th>Status</th><th>Nº O.S. FrotaWeb</th><th>Serviços</th><th>Veículo</th><th>Placa</th><th>KM</th><th>Abertura</th><th>Saída</th><th>Filial</th><th>Departamento</th><th>Defeito</th><th>Fotos</th><th>Retorno</th><th>Criado em</th><th>Ação</th></tr></thead>
-      <tbody>{linhas_os if linhas_os else '<tr><td colspan="16">Nenhuma O.S. encontrada</td></tr>'}</tbody></table>
+    <div class="card" style="padding:0;">
+      <div style="padding:18px 18px 8px;">
+        <h2 style="margin:0;">Ordens de Servi?o</h2>
+        <div class="subtle">A coluna de retorno mostra primeiro a mensagem exata do FrotaWeb e deixa o detalhe tecnico recolhido.</div>
+      </div>
+      <div class="table-wrap">
+        <table><thead><tr><th>ID Painel</th><th>Status</th><th>N? O.S. FrotaWeb</th><th>Servi?os</th><th>Ve?culo</th><th>Placa</th><th>KM</th><th>Abertura</th><th>Sa?da</th><th>Filial</th><th>Departamento</th><th>Defeito</th><th>Fotos</th><th>Retorno</th><th>Criado em</th><th>A??o</th></tr></thead>
+        <tbody>{linhas_os if linhas_os else '<tr><td colspan="16">Nenhuma O.S. encontrada</td></tr>'}</tbody></table>
+      </div>
     </div>
-    <div class="card" style="padding:0; overflow:auto;">
-      <h2 style="padding:18px; margin:0;">Serviços da O.S.</h2>
-      <table><thead><tr><th>ID</th><th>Status</th><th>Nº O.S.</th><th>Veículo</th><th>Placa</th><th>Cód. Serviço</th><th>Recurso</th><th>Tempo</th><th>Valor Hora</th><th>Retorno</th><th>Criado em</th><th>Ação</th></tr></thead>
-      <tbody>{linhas_serv if linhas_serv else '<tr><td colspan="12">Nenhum serviço encontrado</td></tr>'}</tbody></table>
+    <div class="card" style="padding:0;">
+      <div style="padding:18px 18px 8px;">
+        <h2 style="margin:0;">Servi?os da O.S.</h2>
+        <div class="subtle">Servi?os com erro mostram a mensagem do FrotaWeb sem expor senha ou payload bruto.</div>
+      </div>
+      <div class="table-wrap">
+        <table><thead><tr><th>ID</th><th>Status</th><th>N? O.S.</th><th>Ve?culo</th><th>Placa</th><th>C?d. Servi?o</th><th>Recurso</th><th>Tempo</th><th>Valor Hora</th><th>Retorno</th><th>Criado em</th><th>A??o</th></tr></thead>
+        <tbody>{linhas_serv if linhas_serv else '<tr><td colspan="12">Nenhum servi?o encontrado</td></tr>'}</tbody></table>
+      </div>
     </div>
     """
     return html_base("Painel O.S. Corretiva", corpo, msg)
@@ -1300,7 +1415,13 @@ def enviar_os(ordem_id: int, db: Session = Depends(get_db)):
         retorno = post_json(FROTAWEB_OS_URL, payload)
     except HTTPException as exc:
         ordem.status_envio = "ERRO_ENVIO"
-        ordem.retorno_envio = str(exc.detail)
+        ordem.retorno_envio = mensagem_frotaweb(exc.detail)
+        db.commit()
+        return RedirectResponse(url=f"/painel/ordens-servico?msg=Erro ao enviar O.S. {ordem.id}", status_code=303)
+
+    if not resposta_criada_com_sucesso(retorno):
+        ordem.status_envio = "ERRO_ENVIO"
+        ordem.retorno_envio = mensagem_frotaweb(retorno)
         db.commit()
         return RedirectResponse(url=f"/painel/ordens-servico?msg=Erro ao enviar O.S. {ordem.id}", status_code=303)
 
@@ -1316,7 +1437,7 @@ def enviar_os(ordem_id: int, db: Session = Depends(get_db)):
         f"Nº O.S. FrotaWeb: {numero_os_frotaweb or ordem.numero_os or 'não identificado'}. "
         f"Serviços: {resumo_servicos['enviados']}/{resumo_servicos['total']} enviados, "
         f"{resumo_servicos['erros']} erro(s), {resumo_servicos['pendentes']} pendente(s). "
-        f"Retorno O.S.: {retorno}"
+        f"{mensagem_frotaweb(retorno, 'O.S. enviada com sucesso.')}"
     )
     db.commit()
 
@@ -1341,13 +1462,18 @@ def enviar_servico(servico_id: int, db: Session = Depends(get_db)):
         retorno = post_json(FROTAWEB_SERVICO_URL, payload)
     except HTTPException as exc:
         serv.status_envio = "ERRO_ENVIO"
-        serv.retorno_envio = str(exc.detail)
+        serv.retorno_envio = mensagem_frotaweb(exc.detail)
         db.commit()
         return RedirectResponse(url=f"/painel/ordens-servico?msg=Erro ao enviar serviço {serv.id}", status_code=303)
-    serv.status_envio = "ENVIADA"
-    serv.retorno_envio = str(retorno)
+    if resposta_criada_com_sucesso(retorno):
+        serv.status_envio = "ENVIADA"
+        serv.retorno_envio = mensagem_frotaweb(retorno, "Serviço enviado com sucesso.")
+        db.commit()
+        return RedirectResponse(url=f"/painel/ordens-servico?msg=Serviço {serv.id} enviado com sucesso", status_code=303)
+    serv.status_envio = "ERRO_ENVIO"
+    serv.retorno_envio = mensagem_frotaweb(retorno)
     db.commit()
-    return RedirectResponse(url=f"/painel/ordens-servico?msg=Serviço {serv.id} enviado com sucesso", status_code=303)
+    return RedirectResponse(url=f"/painel/ordens-servico?msg=Erro ao enviar serviço {serv.id}", status_code=303)
 
 
 @app.post("/ordens-servico/{ordem_id}/enviar-frotaweb")
@@ -1357,6 +1483,11 @@ def enviar_os_json(ordem_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="O.S. nao encontrada")
     payload = payload_os_from_ordem(ordem)
     retorno = post_json(FROTAWEB_OS_URL, payload)
+    if not resposta_criada_com_sucesso(retorno):
+        ordem.status_envio = "ERRO_ENVIO"
+        ordem.retorno_envio = mensagem_frotaweb(retorno)
+        db.commit()
+        raise HTTPException(status_code=502, detail=mensagem_frotaweb(retorno))
 
     numero_os_frotaweb = extrair_numero_os(retorno)
     if numero_os_frotaweb:
@@ -1369,7 +1500,7 @@ def enviar_os_json(ordem_id: int, db: Session = Depends(get_db)):
         f"O.S. enviada com sucesso. Nº O.S. FrotaWeb: {numero_os_frotaweb or ordem.numero_os or 'não identificado'}. "
         f"Serviços: {resumo_servicos['enviados']}/{resumo_servicos['total']} enviados, "
         f"{resumo_servicos['erros']} erro(s), {resumo_servicos['pendentes']} pendente(s). "
-        f"Retorno O.S.: {retorno}"
+        f"{mensagem_frotaweb(retorno, 'O.S. enviada com sucesso.')}"
     )
     db.commit()
     return {
@@ -1388,7 +1519,12 @@ def enviar_servico_json(servico_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Serviço nao encontrado")
     payload = payload_servico_from_model(serv)
     retorno = post_json(FROTAWEB_SERVICO_URL, payload)
+    if not resposta_criada_com_sucesso(retorno):
+        serv.status_envio = "ERRO_ENVIO"
+        serv.retorno_envio = mensagem_frotaweb(retorno)
+        db.commit()
+        raise HTTPException(status_code=502, detail=mensagem_frotaweb(retorno))
     serv.status_envio = "ENVIADA"
-    serv.retorno_envio = str(retorno)
+    serv.retorno_envio = mensagem_frotaweb(retorno, "Serviço enviado com sucesso.")
     db.commit()
     return {"ok": True, "payload_enviado": payload, "retorno": retorno}
