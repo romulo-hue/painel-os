@@ -7,7 +7,7 @@ from typing import Any, Generator, Optional
 from datetime import datetime
 
 import requests
-from fastapi import FastAPI, Depends, Request, HTTPException, Query
+from fastapi import FastAPI, Depends, Request, HTTPException, Query, BackgroundTasks
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, Text, Boolean, func, text
@@ -168,6 +168,22 @@ class ServicoOS(Base):
     deleted_at = Column(DateTime(timezone=True), nullable=True)
 
 
+class TentativaEnvio(Base):
+    __tablename__ = "tentativas_envio"
+
+    id = Column(Integer, primary_key=True, index=True)
+    tipo_registro = Column(String(20), nullable=False)
+    registro_id = Column(Integer, nullable=False, index=True)
+    status_execucao = Column(String(50), nullable=False, default="PENDENTE")
+    status_http = Column(String(20), nullable=True)
+    sucesso = Column(Boolean, nullable=False, default=False)
+    mensagem = Column(Text, nullable=True)
+    diagnostico = Column(Text, nullable=True)
+    payload_enviado = Column(Text, nullable=True)
+    retorno_recebido = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
 Base.metadata.create_all(bind=engine)
 
 
@@ -274,6 +290,22 @@ def garantir_colunas():
         for nome, tipo in serv_cols.items():
             conn.execute(text(f"ALTER TABLE ordens_servico_servicos ADD COLUMN IF NOT EXISTS {nome} {tipo}"))
         conn.execute(text("UPDATE ordens_servico_servicos SET status_envio = 'PENDENTE' WHERE status_envio IS NULL"))
+
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS tentativas_envio (
+                id SERIAL PRIMARY KEY,
+                tipo_registro VARCHAR(20) NOT NULL,
+                registro_id INTEGER NOT NULL,
+                status_execucao VARCHAR(50) DEFAULT 'PENDENTE',
+                status_http VARCHAR(20),
+                sucesso BOOLEAN DEFAULT FALSE,
+                mensagem TEXT,
+                diagnostico TEXT,
+                payload_enviado TEXT,
+                retorno_recebido TEXT,
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT now()
+            )
+        """))
 
 
 garantir_colunas()
@@ -739,9 +771,153 @@ def enviar_servicos_relacionados(db: Session, ordem: OrdemServico, numero_os_fro
     }
 
 
+def processar_servico_em_fila(servico_id: int) -> None:
+    db = SessionLocal()
+    try:
+        serv = db.query(ServicoOS).filter(ServicoOS.id == servico_id).filter(ServicoOS.deleted_at.is_(None)).first()
+        if not serv:
+            return
+
+        serv.status_envio = "PROCESSANDO"
+        db.commit()
+
+        payload = payload_servico_from_model(serv)
+        try:
+            retorno = post_json(FROTAWEB_SERVICO_URL, payload)
+        except HTTPException as exc:
+            serv.status_envio = "ERRO_ENVIO"
+            serv.retorno_envio = mensagem_frotaweb(exc.detail)
+            registrar_tentativa(
+                db,
+                tipo_registro="SERVICO",
+                registro_id=serv.id,
+                status_execucao="ERRO_ENVIO",
+                status_http=str(getattr(exc, "status_code", "")),
+                sucesso=False,
+                mensagem=serv.retorno_envio,
+                diagnostico=exc.detail,
+                payload_enviado=payload,
+                retorno_recebido=exc.detail,
+            )
+            db.commit()
+            return
+
+        if resposta_criada_com_sucesso(retorno):
+            serv.status_envio = "ENVIADA"
+            serv.retorno_envio = mensagem_frotaweb(retorno, "Serviço enviado com sucesso.")
+            registrar_tentativa(
+                db,
+                tipo_registro="SERVICO",
+                registro_id=serv.id,
+                status_execucao="ENVIADA",
+                status_http="200",
+                sucesso=True,
+                mensagem=serv.retorno_envio,
+                payload_enviado=payload,
+                retorno_recebido=retorno,
+            )
+        else:
+            serv.status_envio = "ERRO_ENVIO"
+            serv.retorno_envio = mensagem_frotaweb(retorno)
+            registrar_tentativa(
+                db,
+                tipo_registro="SERVICO",
+                registro_id=serv.id,
+                status_execucao="ERRO_ENVIO",
+                status_http="200",
+                sucesso=False,
+                mensagem=serv.retorno_envio,
+                payload_enviado=payload,
+                retorno_recebido=retorno,
+            )
+        db.commit()
+    finally:
+        db.close()
+
+
+def processar_ordem_em_fila(ordem_id: int) -> None:
+    db = SessionLocal()
+    try:
+        ordem = db.query(OrdemServico).filter(OrdemServico.id == ordem_id).filter(OrdemServico.deleted_at.is_(None)).first()
+        if not ordem:
+            return
+
+        ordem.status_envio = "PROCESSANDO"
+        db.commit()
+
+        payload = payload_os_from_ordem(ordem)
+        try:
+            retorno = post_json(FROTAWEB_OS_URL, payload)
+        except HTTPException as exc:
+            ordem.status_envio = "ERRO_ENVIO"
+            ordem.retorno_envio = mensagem_frotaweb(exc.detail)
+            registrar_tentativa(
+                db,
+                tipo_registro="OS",
+                registro_id=ordem.id,
+                status_execucao="ERRO_ENVIO",
+                status_http=str(getattr(exc, "status_code", "")),
+                sucesso=False,
+                mensagem=ordem.retorno_envio,
+                diagnostico=exc.detail,
+                payload_enviado=payload,
+                retorno_recebido=exc.detail,
+            )
+            db.commit()
+            return
+
+        if not resposta_criada_com_sucesso(retorno):
+            ordem.status_envio = "ERRO_ENVIO"
+            ordem.retorno_envio = mensagem_frotaweb(retorno)
+            registrar_tentativa(
+                db,
+                tipo_registro="OS",
+                registro_id=ordem.id,
+                status_execucao="ERRO_ENVIO",
+                status_http="200",
+                sucesso=False,
+                mensagem=ordem.retorno_envio,
+                payload_enviado=payload,
+                retorno_recebido=retorno,
+            )
+            db.commit()
+            return
+
+        numero_os_frotaweb = extrair_numero_os(retorno)
+        if numero_os_frotaweb:
+            ordem.numero_os = numero_os_frotaweb
+
+        resumo_servicos = enviar_servicos_relacionados(db, ordem, numero_os_frotaweb or str(ordem.numero_os or ordem.id))
+        ordem.status_envio = "ENVIADA"
+        ordem.retorno_envio = (
+            f"O.S. enviada com sucesso. "
+            f"Nº O.S. FrotaWeb: {numero_os_frotaweb or ordem.numero_os or 'não identificado'}. "
+            f"Serviços: {resumo_servicos['enviados']}/{resumo_servicos['total']} enviados, "
+            f"{resumo_servicos['erros']} erro(s), {resumo_servicos['pendentes']} pendente(s). "
+            f"{mensagem_frotaweb(retorno, 'O.S. enviada com sucesso.')}"
+        )
+        registrar_tentativa(
+            db,
+            tipo_registro="OS",
+            registro_id=ordem.id,
+            status_execucao="ENVIADA",
+            status_http="200",
+            sucesso=True,
+            mensagem=ordem.retorno_envio,
+            payload_enviado=payload,
+            retorno_recebido=retorno,
+            diagnostico={"servicos": resumo_servicos},
+        )
+        db.commit()
+    finally:
+        db.close()
+
+
 def status_class(status: str) -> str:
     if status == "ENVIADA":
         return "status-enviada"
+    if status in ("EM_FILA", "PROCESSANDO"):
+        return "status-pendente"
     if status.startswith("ERRO"):
         return "status-erro"
     return "status-pendente"
@@ -789,6 +965,54 @@ def json_loads_safe(value: str, default: Any = None) -> Any:
         return json.loads(value or "")
     except Exception:
         return default
+
+
+def registrar_tentativa(
+    db: Session,
+    *,
+    tipo_registro: str,
+    registro_id: int,
+    status_execucao: str,
+    status_http: str = "",
+    sucesso: bool = False,
+    mensagem: str = "",
+    diagnostico: Any = None,
+    payload_enviado: Any = None,
+    retorno_recebido: Any = None,
+) -> None:
+    db.add(
+        TentativaEnvio(
+            tipo_registro=tipo_registro,
+            registro_id=registro_id,
+            status_execucao=status_execucao,
+            status_http=to_str(status_http),
+            sucesso=sucesso,
+            mensagem=to_str(mensagem),
+            diagnostico=json_dumps_safe(mascarar_senha(diagnostico)),
+            payload_enviado=json_dumps_safe(mascarar_senha(payload_enviado)),
+            retorno_recebido=json_dumps_safe(mascarar_senha(retorno_recebido)),
+        )
+    )
+
+
+def tentativas_do_registro(db: Session, tipo_registro: str, registro_id: int) -> list[TentativaEnvio]:
+    return (
+        db.query(TentativaEnvio)
+        .filter(TentativaEnvio.tipo_registro == tipo_registro, TentativaEnvio.registro_id == registro_id)
+        .order_by(TentativaEnvio.created_at.desc(), TentativaEnvio.id.desc())
+        .all()
+    )
+
+
+def resumo_fila(status: str) -> str:
+    mapa = {
+        "PENDENTE": "Pendente",
+        "EM_FILA": "Em fila",
+        "PROCESSANDO": "Processando",
+        "ENVIADA": "Enviada",
+        "ERRO_ENVIO": "Com erro",
+    }
+    return mapa.get(status or "PENDENTE", status or "PENDENTE")
 
 
 def flatten_messages(value: Any) -> list[str]:
@@ -1163,7 +1387,7 @@ def render_painel(ordens, servicos, filtros: Optional[dict] = None, msg: str = "
     ordens_filtradas = filtrar_ordens(ordens, filtros)
 
     total_os = len(ordens_filtradas)
-    total_pendentes = len([o for o in ordens_filtradas if (o.status_envio or 'PENDENTE') == 'PENDENTE'])
+    total_pendentes = len([o for o in ordens_filtradas if (o.status_envio or 'PENDENTE') in ('PENDENTE', 'EM_FILA', 'PROCESSANDO')])
     total_enviadas = len([o for o in ordens_filtradas if (o.status_envio or '') == 'ENVIADA'])
     total_erros = len([o for o in ordens_filtradas if str(o.status_envio or '').startswith('ERRO')])
     total_fotos = len([o for o in ordens_filtradas if fotos_da_ordem(o)])
@@ -1209,10 +1433,12 @@ def render_painel(ordens, servicos, filtros: Optional[dict] = None, msg: str = "
         """
         if st == "ENVIADA":
             acoes += "<span class='status-enviada'>O.S. enviada</span>"
+        elif st in ("EM_FILA", "PROCESSANDO"):
+            acoes += "<span class='status-pendente'>Fila em andamento</span>"
         else:
             acoes += f"""
-            <form method="post" action="/painel/ordens-servico/enviar/{o.id}" onsubmit="return confirm('Enviar O.S. {o.id} ao FrotaWeb?')">
-              <button class="btn-green" type="submit">Enviar O.S. + Serviços</button>
+            <form method="post" action="/painel/ordens-servico/enviar/{o.id}" onsubmit="return confirm('Colocar a O.S. {o.id} na fila de envio?')">
+              <button class="btn-green" type="submit">Colocar na fila</button>
             </form>
             """
         acoes += "</div>"
@@ -1245,10 +1471,12 @@ def render_painel(ordens, servicos, filtros: Optional[dict] = None, msg: str = "
         retorno_html = retorno_resumido_html(s.retorno_envio or "", f"/painel/detalhes/servico/{s.id}", success=st == "ENVIADA")
         if st == "ENVIADA":
             acao = "<span class='status-enviada'>Enviado</span>"
+        elif st in ("EM_FILA", "PROCESSANDO"):
+            acao = "<span class='status-pendente'>Fila em andamento</span>"
         else:
             acao = f"""
-            <form method="post" action="/painel/servicos-os/enviar/{s.id}" onsubmit="return confirm('Enviar serviço {s.id} ao FrotaWeb?')">
-              <button class="btn-green" type="submit">Enviar Serviço</button>
+            <form method="post" action="/painel/servicos-os/enviar/{s.id}" onsubmit="return confirm('Colocar o servico {s.id} na fila de envio?')">
+              <button class="btn-green" type="submit">Colocar na fila</button>
             </form>
             """
         linhas_serv += f"""
@@ -1278,6 +1506,8 @@ def render_painel(ordens, servicos, filtros: Optional[dict] = None, msg: str = "
           <select name="status_envio">
             <option value="" {"selected" if not filtros.get("status_envio") else ""}>Status: Todos</option>
             <option value="PENDENTE" {"selected" if filtros.get("status_envio") == "PENDENTE" else ""}>Pendente</option>
+            <option value="EM_FILA" {"selected" if filtros.get("status_envio") == "EM_FILA" else ""}>Em fila</option>
+            <option value="PROCESSANDO" {"selected" if filtros.get("status_envio") == "PROCESSANDO" else ""}>Processando</option>
             <option value="ENVIADA" {"selected" if filtros.get("status_envio") == "ENVIADA" else ""}>Enviada</option>
             <option value="ERRO_ENVIO" {"selected" if filtros.get("status_envio") == "ERRO_ENVIO" else ""}>Erro</option>
           </select>
@@ -1312,9 +1542,13 @@ def render_painel(ordens, servicos, filtros: Optional[dict] = None, msg: str = "
         <div class="toolbar">
           <div>
             <h2 style="margin:0;">Ordens de Serviço</h2>
-            <div class="subtle">A coluna de retorno mostra primeiro a mensagem exata do FrotaWeb e deixa o detalhe tecnico recolhido.</div>
+            <div class="subtle">O painel funciona como fila operacional: clique para enfileirar, acompanhe o processamento e abra o historico quando precisar.</div>
           </div>
           <div class="acoes">
+            <form id="bulk-queue-os-form" method="post" action="/painel/ordens-servico/enviar-lote">
+              <input type="hidden" id="bulk-queue-os-ids" name="ids">
+              <button type="button" class="btn-green" onclick="submitSelected('bulk-queue-os-form', '.ordem-checkbox', 'bulk-queue-os-ids', 'Selecione ao menos uma O.S. para enfileirar.', 'Colocar {{count}} O.S. selecionada(s) na fila?')">Enfileirar selecionadas</button>
+            </form>
             <form id="bulk-delete-os-form" method="post" action="/painel/ordens-servico/deletar-lote">
               <input type="hidden" id="bulk-delete-os-ids" name="ids">
               <button type="button" class="btn-red" onclick="submitSelected('bulk-delete-os-form', '.ordem-checkbox', 'bulk-delete-os-ids', 'Selecione ao menos uma O.S. para excluir.', 'Excluir {{count}} O.S. selecionada(s)?')">Excluir selecionadas</button>
@@ -1335,6 +1569,10 @@ def render_painel(ordens, servicos, filtros: Optional[dict] = None, msg: str = "
             <div class="subtle">Serviços com erro mostram a mensagem do FrotaWeb sem expor senha ou payload bruto.</div>
           </div>
           <div class="acoes">
+                        <form id="bulk-queue-serv-form" method="post" action="/painel/servicos-os/enviar-lote">
+              <input type="hidden" id="bulk-queue-serv-ids" name="ids">
+              <button type="button" class="btn-green" onclick="submitSelected('bulk-queue-serv-form', '.servico-checkbox', 'bulk-queue-serv-ids', 'Selecione ao menos um servico para enfileirar.', 'Colocar {{count}} servico(s) selecionado(s) na fila?')">Enfileirar selecionados</button>
+            </form>
             <form id="bulk-delete-serv-form" method="post" action="/painel/servicos-os/deletar-lote">
               <input type="hidden" id="bulk-delete-serv-ids" name="ids">
               <button type="button" class="btn-red" onclick="submitSelected('bulk-delete-serv-form', '.servico-checkbox', 'bulk-delete-serv-ids', 'Selecione ao menos um serviço para excluir.', 'Excluir {{count}} serviço(s) selecionado(s)?')">Excluir selecionados</button>
@@ -1659,6 +1897,31 @@ async def deletar_ordens_lote(request: Request, db: Session = Depends(get_db)):
     return RedirectResponse(url=f"/painel/ordens-servico?msg={len(ordens)}%20O.S.%20excluida(s)%20em%20lote", status_code=303)
 
 
+@app.post("/painel/ordens-servico/enviar-lote")
+async def enfileirar_ordens_lote(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+):
+    form = await request.form()
+    ids = parse_ids_lote(form.get("ids"))
+    if not ids:
+        return RedirectResponse(url="/painel/ordens-servico?msg=Nenhuma%20O.S.%20selecionada%20para%20enfileirar", status_code=303)
+
+    ordens = db.query(OrdemServico).filter(OrdemServico.id.in_(ids)).filter(OrdemServico.deleted_at.is_(None)).all()
+    total = 0
+    for ordem in ordens:
+        if ordem.status_envio in ("ENVIADA", "EM_FILA", "PROCESSANDO"):
+            continue
+        ordem.status_envio = "EM_FILA"
+        ordem.retorno_envio = "O.S. colocada na fila de envio. O painel vai processar em segundo plano."
+        background_tasks.add_task(processar_ordem_em_fila, ordem.id)
+        total += 1
+
+    db.commit()
+    return RedirectResponse(url=f"/painel/ordens-servico?msg={total}%20O.S.%20colocada(s)%20na%20fila", status_code=303)
+
+
 @app.post("/painel/servicos-os/deletar-lote")
 async def deletar_servicos_lote(request: Request, db: Session = Depends(get_db)):
     form = await request.form()
@@ -1672,6 +1935,31 @@ async def deletar_servicos_lote(request: Request, db: Session = Depends(get_db))
 
     db.commit()
     return RedirectResponse(url=f"/painel/ordens-servico?msg={len(servicos)}%20servico(s)%20excluido(s)%20em%20lote", status_code=303)
+
+
+@app.post("/painel/servicos-os/enviar-lote")
+async def enfileirar_servicos_lote(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+):
+    form = await request.form()
+    ids = parse_ids_lote(form.get("ids"))
+    if not ids:
+        return RedirectResponse(url="/painel/ordens-servico?msg=Nenhum%20servico%20selecionado%20para%20enfileirar", status_code=303)
+
+    servicos = db.query(ServicoOS).filter(ServicoOS.id.in_(ids)).filter(ServicoOS.deleted_at.is_(None)).all()
+    total = 0
+    for serv in servicos:
+        if serv.status_envio in ("ENVIADA", "EM_FILA", "PROCESSANDO"):
+            continue
+        serv.status_envio = "EM_FILA"
+        serv.retorno_envio = "Servico colocado na fila de envio. O painel vai processar em segundo plano."
+        background_tasks.add_task(processar_servico_em_fila, serv.id)
+        total += 1
+
+    db.commit()
+    return RedirectResponse(url=f"/painel/ordens-servico?msg={total}%20servico(s)%20colocado(s)%20na%20fila", status_code=303)
 
 
 @app.post("/painel/ordens-servico/limpar-cache")
@@ -1698,16 +1986,33 @@ def ver_detalhes_retorno(tipo: str, registro_id: int, db: Session = Depends(get_
         retorno = registro.retorno_envio or ""
         payload_original = mascarar_senha(json_loads_safe(registro.payload_original or "", registro.payload_original))
         payload_app = mascarar_senha(json_loads_safe(registro.app_payload or "", registro.app_payload))
+        tentativas = tentativas_do_registro(db, "OS", registro.id)
     elif tipo == "servico":
         registro = db.query(ServicoOS).filter(ServicoOS.id == registro_id).first()
         if not registro:
-            raise HTTPException(status_code=404, detail="Serviço nao encontrado")
-        titulo = f"Detalhes do Serviço {registro.id}"
+            raise HTTPException(status_code=404, detail="Servico nao encontrado")
+        titulo = f"Detalhes do Servico {registro.id}"
         retorno = registro.retorno_envio or ""
         payload_original = mascarar_senha(json_loads_safe(registro.payload_original or "", registro.payload_original))
         payload_app = payload_original
+        tentativas = tentativas_do_registro(db, "SERVICO", registro.id)
     else:
-        raise HTTPException(status_code=404, detail="Tipo de detalhe inválido")
+        raise HTTPException(status_code=404, detail="Tipo de detalhe invalido")
+
+    historico = ""
+    if tentativas:
+        blocos = []
+        for tentativa in tentativas:
+            blocos.append(
+                f"<div class='card'>"
+                f"<strong>{escape_html(tentativa.status_execucao or '')}</strong> "
+                f"<span class='small'>HTTP {escape_html(tentativa.status_http or '-')} | "
+                f"{tentativa.created_at.strftime('%d/%m/%Y %H:%M:%S') if tentativa.created_at else ''}</span>"
+                f"<div style='margin-top:8px'>{escape_html(tentativa.mensagem or '')}</div>"
+                f"<details style='margin-top:8px'><summary>Diagnostico</summary><pre>{escape_html(tentativa.diagnostico or '')}</pre></details>"
+                f"</div>"
+            )
+        historico = "<div class='card'><h3 style='margin-top:0;'>Historico de tentativas</h3>" + "".join(blocos) + "</div>"
 
     corpo = f"""
     <div class="card">
@@ -1729,6 +2034,7 @@ def ver_detalhes_retorno(tipo: str, registro_id: int, db: Session = Depends(get_
       <h3 style="margin-top:0;">Payload do app</h3>
       <pre>{escape_html(json_dumps_safe(payload_app))}</pre>
     </div>
+    {historico}
     <div class="acoes">
       <a class="btn btn-gray" href="/painel/ordens-servico" target="_self">Voltar ao painel</a>
     </div>
@@ -1736,78 +2042,30 @@ def ver_detalhes_retorno(tipo: str, registro_id: int, db: Session = Depends(get_
     return HTMLResponse(html_base(titulo, corpo))
 
 
-
 @app.post("/painel/ordens-servico/enviar/{ordem_id}")
-def enviar_os(ordem_id: int, db: Session = Depends(get_db)):
+def enviar_os(ordem_id: int, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
     ordem = db.query(OrdemServico).filter(OrdemServico.id == ordem_id).filter(OrdemServico.deleted_at.is_(None)).first()
     if not ordem:
         raise HTTPException(status_code=404, detail="O.S. nao encontrada")
 
-    payload = payload_os_from_ordem(ordem)
-
-    try:
-        retorno = post_json(FROTAWEB_OS_URL, payload)
-    except HTTPException as exc:
-        ordem.status_envio = "ERRO_ENVIO"
-        ordem.retorno_envio = mensagem_frotaweb(exc.detail)
-        db.commit()
-        return RedirectResponse(url=f"/painel/ordens-servico?msg=Erro ao enviar O.S. {ordem.id}", status_code=303)
-
-    if not resposta_criada_com_sucesso(retorno):
-        ordem.status_envio = "ERRO_ENVIO"
-        ordem.retorno_envio = mensagem_frotaweb(retorno)
-        db.commit()
-        return RedirectResponse(url=f"/painel/ordens-servico?msg=Erro ao enviar O.S. {ordem.id}", status_code=303)
-
-    numero_os_frotaweb = extrair_numero_os(retorno)
-    if numero_os_frotaweb:
-        ordem.numero_os = numero_os_frotaweb
-
-    resumo_servicos = enviar_servicos_relacionados(db, ordem, numero_os_frotaweb or str(ordem.numero_os or ordem.id))
-
-    ordem.status_envio = "ENVIADA"
-    ordem.retorno_envio = (
-        f"O.S. enviada com sucesso. "
-        f"Nº O.S. FrotaWeb: {numero_os_frotaweb or ordem.numero_os or 'não identificado'}. "
-        f"Serviços: {resumo_servicos['enviados']}/{resumo_servicos['total']} enviados, "
-        f"{resumo_servicos['erros']} erro(s), {resumo_servicos['pendentes']} pendente(s). "
-        f"{mensagem_frotaweb(retorno, 'O.S. enviada com sucesso.')}"
-    )
+    ordem.status_envio = "EM_FILA"
+    ordem.retorno_envio = "O.S. colocada na fila de envio. O painel vai processar em segundo plano."
     db.commit()
-
-    msg = (
-        f"O.S. {ordem.id} enviada com sucesso. "
-        f"Nº FrotaWeb: {numero_os_frotaweb or ordem.numero_os or 'não identificado'}. "
-        f"Serviços: {resumo_servicos['enviados']}/{resumo_servicos['total']} enviados."
-    )
-    if resumo_servicos["erros"]:
-        msg += f" {resumo_servicos['erros']} serviço(s) com erro."
-
-    return RedirectResponse(url=f"/painel/ordens-servico?msg={msg}", status_code=303)
+    background_tasks.add_task(processar_ordem_em_fila, ordem.id)
+    return RedirectResponse(url=f"/painel/ordens-servico?msg=O.S.%20{ordem.id}%20colocada%20na%20fila%20de%20envio", status_code=303)
 
 
 @app.post("/painel/servicos-os/enviar/{servico_id}")
-def enviar_servico(servico_id: int, db: Session = Depends(get_db)):
+def enviar_servico(servico_id: int, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
     serv = db.query(ServicoOS).filter(ServicoOS.id == servico_id).filter(ServicoOS.deleted_at.is_(None)).first()
     if not serv:
-        raise HTTPException(status_code=404, detail="Serviço nao encontrado")
-    payload = payload_servico_from_model(serv)
-    try:
-        retorno = post_json(FROTAWEB_SERVICO_URL, payload)
-    except HTTPException as exc:
-        serv.status_envio = "ERRO_ENVIO"
-        serv.retorno_envio = mensagem_frotaweb(exc.detail)
-        db.commit()
-        return RedirectResponse(url=f"/painel/ordens-servico?msg=Erro ao enviar serviço {serv.id}", status_code=303)
-    if resposta_criada_com_sucesso(retorno):
-        serv.status_envio = "ENVIADA"
-        serv.retorno_envio = mensagem_frotaweb(retorno, "Serviço enviado com sucesso.")
-        db.commit()
-        return RedirectResponse(url=f"/painel/ordens-servico?msg=Serviço {serv.id} enviado com sucesso", status_code=303)
-    serv.status_envio = "ERRO_ENVIO"
-    serv.retorno_envio = mensagem_frotaweb(retorno)
+        raise HTTPException(status_code=404, detail="Servico nao encontrado")
+
+    serv.status_envio = "EM_FILA"
+    serv.retorno_envio = "Servico colocado na fila de envio. O painel vai processar em segundo plano."
     db.commit()
-    return RedirectResponse(url=f"/painel/ordens-servico?msg=Erro ao enviar serviço {serv.id}", status_code=303)
+    background_tasks.add_task(processar_servico_em_fila, serv.id)
+    return RedirectResponse(url=f"/painel/ordens-servico?msg=Servico%20{serv.id}%20colocado%20na%20fila%20de%20envio", status_code=303)
 
 
 @app.post("/ordens-servico/{ordem_id}/enviar-frotaweb")
