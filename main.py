@@ -2,6 +2,7 @@ import os
 import json
 import base64
 import logging
+import time
 from typing import Any, Generator, Optional
 from datetime import datetime
 
@@ -42,6 +43,8 @@ FROTAWEB_SENHA = os.getenv("FROTAWEB_SENHA", "")
 FROTAWEB_FILIAL = os.getenv("FROTAWEB_FILIAL", "1")
 FROTAWEB_RECURSO_HUMANO = os.getenv("FROTAWEB_RECURSO_HUMANO", "")
 HTTP_VERIFY_TLS = str(os.getenv("HTTP_VERIFY_TLS", "false")).strip().lower() in ("1", "true", "yes", "on")
+HTTP_MAX_RETRIES = max(1, int(os.getenv("HTTP_MAX_RETRIES", "3")))
+HTTP_RETRY_BACKOFF_SECONDS = max(1, int(os.getenv("HTTP_RETRY_BACKOFF_SECONDS", "2")))
 
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -499,10 +502,35 @@ def payload_servico_from_model(s: ServicoOS) -> dict:
 
 
 def post_json(url: str, payload: dict) -> dict:
-    try:
-        resp = requests.post(url, json=payload, timeout=120, verify=HTTP_VERIFY_TLS)
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Erro ao conectar: {str(exc)}")
+    resp = None
+    last_error = None
+    for tentativa in range(1, HTTP_MAX_RETRIES + 1):
+        try:
+            resp = requests.post(url, json=payload, timeout=120, verify=HTTP_VERIFY_TLS)
+        except Exception as exc:
+            last_error = exc
+            if tentativa >= HTTP_MAX_RETRIES:
+                raise HTTPException(status_code=500, detail=f"Erro ao conectar: {str(exc)}")
+            time.sleep(HTTP_RETRY_BACKOFF_SECONDS * tentativa)
+            continue
+
+        if resp.status_code != 429:
+            break
+
+        retry_after_header = str(resp.headers.get("Retry-After") or "").strip()
+        try:
+            retry_after = max(1, int(retry_after_header))
+        except Exception:
+            retry_after = HTTP_RETRY_BACKOFF_SECONDS * tentativa
+
+        if tentativa >= HTTP_MAX_RETRIES:
+            break
+
+        logger.warning("Recebido 429 ao enviar para %s; aguardando %ss antes da nova tentativa", url, retry_after)
+        time.sleep(retry_after)
+
+    if resp is None:
+        raise HTTPException(status_code=500, detail=f"Erro ao conectar: {str(last_error)}")
 
     try:
         retorno = resp.json()
@@ -510,6 +538,15 @@ def post_json(url: str, payload: dict) -> dict:
         retorno = {"raw": resp.text}
 
     if resp.status_code not in (200, 201):
+        if resp.status_code == 429:
+            raise HTTPException(
+                status_code=429,
+                detail={
+                    "url": url,
+                    "mensagem_frotaweb": "Too Many Requests. O painel tentou novamente, mas a API ainda estava limitando as requisicoes. Aguarde alguns segundos e reenvie.",
+                    "retorno": mascarar_senha(retorno),
+                },
+            )
         raise HTTPException(
             status_code=resp.status_code,
             detail={
