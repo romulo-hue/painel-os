@@ -1,7 +1,9 @@
 import os
 import json
 import base64
+import logging
 from typing import Any, Generator, Optional
+from datetime import datetime
 
 import requests
 from fastapi import FastAPI, Depends, Request, HTTPException, Query
@@ -39,10 +41,12 @@ FROTAWEB_USUARIO = os.getenv("FROTAWEB_USUARIO", "")
 FROTAWEB_SENHA = os.getenv("FROTAWEB_SENHA", "")
 FROTAWEB_FILIAL = os.getenv("FROTAWEB_FILIAL", "1")
 FROTAWEB_RECURSO_HUMANO = os.getenv("FROTAWEB_RECURSO_HUMANO", "")
+HTTP_VERIFY_TLS = str(os.getenv("HTTP_VERIFY_TLS", "false")).strip().lower() in ("1", "true", "yes", "on")
 
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
+logger = logging.getLogger("painel_os")
 
 app = FastAPI(
     title="Painel O.S. Corretiva - Tryout FrotaWeb",
@@ -496,7 +500,7 @@ def payload_servico_from_model(s: ServicoOS) -> dict:
 
 def post_json(url: str, payload: dict) -> dict:
     try:
-        resp = requests.post(url, json=payload, timeout=120)
+        resp = requests.post(url, json=payload, timeout=120, verify=HTTP_VERIFY_TLS)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Erro ao conectar: {str(exc)}")
 
@@ -1275,45 +1279,51 @@ async def receber_os(request: Request, db: Session = Depends(get_db)):
         dados = await request.json()
     except Exception:
         raise HTTPException(status_code=400, detail="JSON invalido")
+    try:
+        p = montar_payload_os(dados)
+        if not p["codigo_veiculo"] and not p["placa"]:
+            raise HTTPException(status_code=400, detail="Informe codigo_veiculo ou placa")
 
-    p = montar_payload_os(dados)
-    if not p["codigo_veiculo"] and not p["placa"]:
-        raise HTTPException(status_code=400, detail="Informe codigo_veiculo ou placa")
-
-    c = p["credenciais"]
-    validar_credenciais_painel(c, origem="app/O.S.")
-    fotos_recebidas = salvar_fotos_app(dados)
-    ordem = OrdemServico(
-        empresa=c["empresa"], usuario=c["usuario"], senha=c["senha"], filial=c["filial"], recurso_humano=c["recurso_humano"],
-        codigo_veiculo=p["codigo_veiculo"], descricao_defeito=p["descricao_defeito"], numero_os=p["numero_os"], placa=p["placa"],
-        codigo_componente=p["codigo_componente"], data_abertura=p["data_abertura"], data_hora_abertura=p["data_hora_abertura"],
-        hodometro=p["hodometro"], horimetro_entrada=p["horimetro_entrada"], data_hora_saida=p["data_hora_saida"],
-        hodometro_saida=p["hodometro_saida"], horimetro_saida=p["horimetro_saida"], data_hora_inicio=p["data_hora_inicio"],
-        data_hora_previsao_liberacao=p["data_hora_previsao_liberacao"], horas_previstas=p["horas_previstas"], horas_realizadas=p["horas_realizadas"],
-        codigo_filial=p["codigo_filial"], codigo_departamento=p["codigo_departamento"], codigo_oficina=p["codigo_oficina"], codigo_servico=p["codigo_servico"],
-        codigo_solicitante=p["codigo_solicitante"], codigo_motorista=p["codigo_motorista"], numero_ocorrencia=p["numero_ocorrencia"],
-        numero_contrato=p["numero_contrato"], valor_acrescimo=p["valor_acrescimo"], numero_os_retorno=p["numero_os_retorno"], observacoes=p["observacoes"],
-        investimento=p["investimento"], acidente=p["acidente"], socorro=p["socorro"], servico_retorno=p["servico_retorno"], programada=p["programada"],
-        status_envio="PENDENTE",
-        retorno_envio="O.S. salva no painel. Aguardando envio manual.",
-        payload_original=json_dumps_safe(mascarar_senha(dados)),
-        campos_brutos=json_dumps_safe(p["campos_brutos"]),
-        fotos_app=json_dumps_safe(fotos_recebidas),
-        app_payload=json_dumps_safe(dados),
-    )
-    db.add(ordem)
-    db.commit()
-    db.refresh(ordem)
-    return {
-        "ok": True,
-        "created": True,
-        "id": ordem.id,
-        "order_number": str(ordem.id),
-        "status_envio": ordem.status_envio,
-        "message": "O.S. salva no painel.",
-        "fotos_recebidas": len(fotos_recebidas),
-        "payload_tryout": payload_os_from_ordem(ordem),
-    }
+        c = p["credenciais"]
+        validar_credenciais_painel(c, origem="app/O.S.")
+        fotos_recebidas = salvar_fotos_app(dados)
+        ordem = OrdemServico(
+            empresa=c["empresa"], usuario=c["usuario"], senha=c["senha"], filial=c["filial"], recurso_humano=c["recurso_humano"],
+            codigo_veiculo=p["codigo_veiculo"], descricao_defeito=p["descricao_defeito"], numero_os=p["numero_os"], placa=p["placa"],
+            codigo_componente=p["codigo_componente"], data_abertura=p["data_abertura"], data_hora_abertura=p["data_hora_abertura"],
+            hodometro=p["hodometro"], horimetro_entrada=p["horimetro_entrada"], data_hora_saida=p["data_hora_saida"],
+            hodometro_saida=p["hodometro_saida"], horimetro_saida=p["horimetro_saida"], data_hora_inicio=p["data_hora_inicio"],
+            data_hora_previsao_liberacao=p["data_hora_previsao_liberacao"], horas_previstas=p["horas_previstas"], horas_realizadas=p["horas_realizadas"],
+            codigo_filial=p["codigo_filial"], codigo_departamento=p["codigo_departamento"], codigo_oficina=p["codigo_oficina"], codigo_servico=p["codigo_servico"],
+            codigo_solicitante=p["codigo_solicitante"], codigo_motorista=p["codigo_motorista"], numero_ocorrencia=p["numero_ocorrencia"],
+            numero_contrato=p["numero_contrato"], valor_acrescimo=p["valor_acrescimo"], numero_os_retorno=p["numero_os_retorno"], observacoes=p["observacoes"],
+            investimento=p["investimento"], acidente=p["acidente"], socorro=p["socorro"], servico_retorno=p["servico_retorno"], programada=p["programada"],
+            status_envio="PENDENTE",
+            retorno_envio="O.S. salva no painel. Aguardando envio manual.",
+            payload_original=json_dumps_safe(mascarar_senha(dados)),
+            campos_brutos=json_dumps_safe(p["campos_brutos"]),
+            fotos_app=json_dumps_safe(fotos_recebidas),
+            app_payload=json_dumps_safe(mascarar_senha(dados)),
+        )
+        db.add(ordem)
+        db.commit()
+        db.refresh(ordem)
+        return {
+            "ok": True,
+            "created": True,
+            "id": ordem.id,
+            "order_number": str(ordem.id),
+            "status_envio": ordem.status_envio,
+            "message": "O.S. salva no painel.",
+            "fotos_recebidas": len(fotos_recebidas),
+            "payload_tryout": payload_os_from_ordem(ordem),
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        db.rollback()
+        logger.exception("Erro ao salvar O.S. no painel")
+        raise HTTPException(status_code=500, detail=f"Erro ao salvar O.S. no painel: {exc}")
 
 
 @app.post("/panel/os/servicos")
@@ -1324,24 +1334,34 @@ async def receber_servico(request: Request, db: Session = Depends(get_db)):
     except Exception:
         raise HTTPException(status_code=400, detail="JSON invalido")
 
-    p = montar_payload_servico(dados)
-    if not p["numero_os"]:
-        raise HTTPException(status_code=400, detail="Informe numero_os")
-    if not p["codigo_servico"]:
-        raise HTTPException(status_code=400, detail="Informe codigo_servico")
+    try:
+        p = montar_payload_servico(dados)
+        if not p["numero_os"]:
+            raise HTTPException(status_code=400, detail="Informe numero_os")
+        if not p["codigo_servico"]:
+            raise HTTPException(status_code=400, detail="Informe codigo_servico")
 
-    c = p["credenciais"]
-    validar_credenciais_painel(c, origem="app/servico")
-    serv = ServicoOS(
-        empresa=c["empresa"], usuario=c["usuario"], senha=c["senha"], filial=c["filial"], recurso_humano=c["recurso_humano"],
-        numero_os=p["numero_os"], codigo_veiculo=p["codigo_veiculo"], placa=p["placa"], codigo_servico=p["codigo_servico"],
-        codigo_recurso_humano=p["codigo_recurso_humano"], tempo_gasto=p["tempo_gasto"], valor_hora=p["valor_hora"],
-        status_envio="PENDENTE", retorno_envio="Serviço salvo no painel. Aguardando envio manual.", payload_original=str(dados), campos_brutos=str(p["campos_brutos"]),
-    )
-    db.add(serv)
-    db.commit()
-    db.refresh(serv)
-    return {"ok": True, "created": True, "id": serv.id, "status_envio": serv.status_envio, "message": "Serviço salvo no painel.", "payload_tryout": payload_servico_from_model(serv)}
+        c = p["credenciais"]
+        validar_credenciais_painel(c, origem="app/servico")
+        serv = ServicoOS(
+            empresa=c["empresa"], usuario=c["usuario"], senha=c["senha"], filial=c["filial"], recurso_humano=c["recurso_humano"],
+            numero_os=p["numero_os"], codigo_veiculo=p["codigo_veiculo"], placa=p["placa"], codigo_servico=p["codigo_servico"],
+            codigo_recurso_humano=p["codigo_recurso_humano"], tempo_gasto=p["tempo_gasto"], valor_hora=p["valor_hora"],
+            status_envio="PENDENTE",
+            retorno_envio="Servi?o salvo no painel. Aguardando envio manual.",
+            payload_original=json_dumps_safe(mascarar_senha(dados)),
+            campos_brutos=json_dumps_safe(p["campos_brutos"]),
+        )
+        db.add(serv)
+        db.commit()
+        db.refresh(serv)
+        return {"ok": True, "created": True, "id": serv.id, "status_envio": serv.status_envio, "message": "Servi?o salvo no painel.", "payload_tryout": payload_servico_from_model(serv)}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        db.rollback()
+        logger.exception("Erro ao salvar servi?o no painel")
+        raise HTTPException(status_code=500, detail=f"Erro ao salvar servi?o no painel: {exc}")
 
 
 @app.get("/ordens-servico")
