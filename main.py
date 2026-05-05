@@ -335,6 +335,35 @@ def credenciais_from(dados: dict) -> dict:
     }
 
 
+def primeira_linha_mensagem(value: Any, fallback: str = "Sem retorno") -> str:
+    texto = mensagem_frotaweb(value, fallback)
+    for separador in ("\n", " | "):
+        if separador in texto:
+            return texto.split(separador, 1)[0].strip()
+    return texto.strip()
+
+
+def validar_credenciais_painel(credenciais: dict, *, origem: str) -> None:
+    faltando: list[str] = []
+    if not str(credenciais.get("empresa") or "").strip():
+        faltando.append("empresa")
+    if not str(credenciais.get("usuario") or "").strip():
+        faltando.append("usuario")
+    if not str(credenciais.get("senha") or "").strip():
+        faltando.append("senha")
+    if not str(credenciais.get("recurso_humano") or "").strip():
+        faltando.append("recurso_humano")
+    if faltando:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Credenciais obrigatorias ausentes no envio do {origem}: "
+                + ", ".join(faltando)
+                + ". Preencha usuario, senha e recurso humano no app antes de enviar."
+            ),
+        )
+
+
 def montar_payload_os(dados: dict) -> dict:
     abertura = pick(dados, "data_hora_abertura", "opening_datetime", "dh_entrada")
     saida = pick(dados, "data_hora_saida", "exit_datetime", "dh_saida")
@@ -703,7 +732,7 @@ def resposta_criada_com_sucesso(retorno: Any) -> bool:
 
 
 def retorno_resumido_html(value: Any, detail_url: str, success: bool = False) -> str:
-    resumo = escape_html(mensagem_frotaweb(value, "Sem retorno"))
+    resumo = escape_html(primeira_linha_mensagem(value, "Sem retorno"))
     css = "retorno-ok" if success else "retorno-erro"
     return (
         f"<div class='retorno-bloco {css}'>"
@@ -1252,6 +1281,7 @@ async def receber_os(request: Request, db: Session = Depends(get_db)):
         raise HTTPException(status_code=400, detail="Informe codigo_veiculo ou placa")
 
     c = p["credenciais"]
+    validar_credenciais_painel(c, origem="app/O.S.")
     fotos_recebidas = salvar_fotos_app(dados)
     ordem = OrdemServico(
         empresa=c["empresa"], usuario=c["usuario"], senha=c["senha"], filial=c["filial"], recurso_humano=c["recurso_humano"],
@@ -1301,6 +1331,7 @@ async def receber_servico(request: Request, db: Session = Depends(get_db)):
         raise HTTPException(status_code=400, detail="Informe codigo_servico")
 
     c = p["credenciais"]
+    validar_credenciais_painel(c, origem="app/servico")
     serv = ServicoOS(
         empresa=c["empresa"], usuario=c["usuario"], senha=c["senha"], filial=c["filial"], recurso_humano=c["recurso_humano"],
         numero_os=p["numero_os"], codigo_veiculo=p["codigo_veiculo"], placa=p["placa"], codigo_servico=p["codigo_servico"],
