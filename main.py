@@ -702,15 +702,13 @@ def resposta_criada_com_sucesso(retorno: Any) -> bool:
     return True
 
 
-def retorno_resumido_html(value: Any, success: bool = False) -> str:
+def retorno_resumido_html(value: Any, detail_url: str, success: bool = False) -> str:
     resumo = escape_html(mensagem_frotaweb(value, "Sem retorno"))
-    detalhes_obj = mascarar_senha(value)
-    detalhes = escape_html(json_dumps_safe(detalhes_obj))
     css = "retorno-ok" if success else "retorno-erro"
     return (
         f"<div class='retorno-bloco {css}'>"
         f"<div class='retorno-resumo'>{resumo}</div>"
-        f"<details class='retorno-detalhes'><summary>Ver detalhes</summary><pre>{detalhes}</pre></details>"
+        f"<div class='retorno-detalhes'><a href='{escape_html(detail_url)}' target='_blank' rel='noopener noreferrer'>Ver detalhes</a></div>"
         f"</div>"
     )
 
@@ -1006,7 +1004,7 @@ def render_painel(ordens, servicos, filtros: Optional[dict] = None, msg: str = "
     linhas_os = ""
     for o in ordens_filtradas:
         st = o.status_envio or "PENDENTE"
-        retorno_html = retorno_resumido_html(o.retorno_envio or "", success=st == "ENVIADA")
+        retorno_html = retorno_resumido_html(o.retorno_envio or "", f"/painel/detalhes/os/{o.id}", success=st == "ENVIADA")
 
         serv_rel = servicos_por_ordem.get(o.id, [])
         total_serv = len(serv_rel)
@@ -1061,7 +1059,7 @@ def render_painel(ordens, servicos, filtros: Optional[dict] = None, msg: str = "
     linhas_serv = ""
     for s in servicos:
         st = s.status_envio or "PENDENTE"
-        retorno_html = retorno_resumido_html(s.retorno_envio or "", success=st == "ENVIADA")
+        retorno_html = retorno_resumido_html(s.retorno_envio or "", f"/painel/detalhes/servico/{s.id}", success=st == "ENVIADA")
         if st == "ENVIADA":
             acao = "<span class='status-enviada'>Enviado</span>"
         else:
@@ -1119,6 +1117,9 @@ def render_painel(ordens, servicos, filtros: Optional[dict] = None, msg: str = "
         <div class="acoes">
           <button type="submit">Filtrar</button>
           <a class="btn btn-gray" href="/painel/ordens-servico">Limpar</a>
+          <form method="post" action="/painel/ordens-servico/limpar-cache" onsubmit="return confirm('Limpar toda a fila/cache de O.S. e serviços do painel?');">
+            <button type="submit" class="btn-red">Limpar cache</button>
+          </form>
           <a class="btn btn-gray" href="/docs">Docs</a>
         </div>
       </form>
@@ -1400,6 +1401,68 @@ def deletar_ordem(ordem_id: int, db: Session = Depends(get_db)):
 
     db.commit()
     return RedirectResponse(url="/painel/ordens-servico?msg=O.S.%20deletada%20com%20sucesso", status_code=303)
+
+
+@app.post("/painel/ordens-servico/limpar-cache")
+def limpar_cache_ordens(db: Session = Depends(get_db)):
+    db.query(ServicoOS).filter(ServicoOS.deleted_at.is_(None)).update(
+        {ServicoOS.deleted_at: func.now()},
+        synchronize_session=False,
+    )
+    db.query(OrdemServico).filter(OrdemServico.deleted_at.is_(None)).update(
+        {OrdemServico.deleted_at: func.now()},
+        synchronize_session=False,
+    )
+    db.commit()
+    return RedirectResponse(url="/painel/ordens-servico?msg=Cache%20do%20painel%20limpo%20com%20sucesso", status_code=303)
+
+
+@app.get("/painel/detalhes/{tipo}/{registro_id}", response_class=HTMLResponse)
+def ver_detalhes_retorno(tipo: str, registro_id: int, db: Session = Depends(get_db)):
+    if tipo == "os":
+        registro = db.query(OrdemServico).filter(OrdemServico.id == registro_id).first()
+        if not registro:
+            raise HTTPException(status_code=404, detail="O.S. nao encontrada")
+        titulo = f"Detalhes da O.S. {registro.id}"
+        retorno = registro.retorno_envio or ""
+        payload_original = mascarar_senha(json_loads_safe(registro.payload_original or "", registro.payload_original))
+        payload_app = mascarar_senha(json_loads_safe(registro.app_payload or "", registro.app_payload))
+    elif tipo == "servico":
+        registro = db.query(ServicoOS).filter(ServicoOS.id == registro_id).first()
+        if not registro:
+            raise HTTPException(status_code=404, detail="Serviço nao encontrado")
+        titulo = f"Detalhes do Serviço {registro.id}"
+        retorno = registro.retorno_envio or ""
+        payload_original = mascarar_senha(json_loads_safe(registro.payload_original or "", registro.payload_original))
+        payload_app = payload_original
+    else:
+        raise HTTPException(status_code=404, detail="Tipo de detalhe inválido")
+
+    corpo = f"""
+    <div class="card">
+      <h2 style="margin-top:0;">{escape_html(titulo)}</h2>
+      <p class="subtle">Mensagem resumida do FrotaWeb</p>
+      <div class="retorno-bloco {'retorno-ok' if 'ERRO' not in str(retorno) else 'retorno-erro'}">
+        <div class="retorno-resumo">{escape_html(mensagem_frotaweb(retorno, 'Sem retorno'))}</div>
+      </div>
+    </div>
+    <div class="card">
+      <h3 style="margin-top:0;">Retorno completo salvo no painel</h3>
+      <pre>{escape_html(json_dumps_safe(mascarar_senha(json_loads_safe(retorno, retorno))))}</pre>
+    </div>
+    <div class="card">
+      <h3 style="margin-top:0;">Payload original</h3>
+      <pre>{escape_html(json_dumps_safe(payload_original))}</pre>
+    </div>
+    <div class="card">
+      <h3 style="margin-top:0;">Payload do app</h3>
+      <pre>{escape_html(json_dumps_safe(payload_app))}</pre>
+    </div>
+    <div class="acoes">
+      <a class="btn btn-gray" href="/painel/ordens-servico" target="_self">Voltar ao painel</a>
+    </div>
+    """
+    return HTMLResponse(html_base(titulo, corpo))
 
 
 
