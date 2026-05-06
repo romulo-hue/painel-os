@@ -4,9 +4,11 @@ import base64
 import logging
 import time
 import threading
+import io
 from typing import Any, Generator, Optional
 from datetime import datetime
 
+import pandas as pd
 import requests
 from fastapi import FastAPI, Depends, Request, HTTPException, Query
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -190,6 +192,19 @@ class TentativaEnvio(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
+class CadastroPlaca(Base):
+    __tablename__ = "cadastro_placas"
+
+    id = Column(Integer, primary_key=True, index=True)
+    placa = Column(String(50), nullable=False, unique=True, index=True)
+    cd_veiculo = Column(String(100), nullable=True)
+    cd_ccusto = Column(String(100), nullable=True)
+    cd_filial = Column(String(100), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+    deleted_at = Column(DateTime(timezone=True), nullable=True)
+
+
 Base.metadata.create_all(bind=engine)
 
 
@@ -310,6 +325,19 @@ def garantir_colunas():
                 payload_enviado TEXT,
                 retorno_recebido TEXT,
                 created_at TIMESTAMP WITH TIME ZONE DEFAULT now()
+            )
+        """))
+
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS cadastro_placas (
+                id SERIAL PRIMARY KEY,
+                placa VARCHAR(50) NOT NULL UNIQUE,
+                cd_veiculo VARCHAR(100),
+                cd_ccusto VARCHAR(100),
+                cd_filial VARCHAR(100),
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT now(),
+                updated_at TIMESTAMP WITH TIME ZONE DEFAULT now(),
+                deleted_at TIMESTAMP WITH TIME ZONE
             )
         """))
 
@@ -1197,12 +1225,12 @@ def html_fotos_ordem(ordem: OrdemServico) -> str:
     for idx, foto in enumerate(fotos, start=1):
         foto_esc = escape_html(foto)
         partes.append(
-            f"<a href='{foto_esc}' target='_blank' title='Foto {idx}'>"
-            f"<img src='{foto_esc}' class='foto-thumb' alt='Foto {idx}'>"
+            f"<a href='{foto_esc}' target='_blank' rel='noopener noreferrer' title='Abrir foto {idx} em nova guia'>"
+            f"Foto {idx}"
             f"</a>"
         )
 
-    return "<div class='foto-grid'>" + "".join(partes) + "</div>"
+    return "<div class='foto-grid'>" + " | ".join(partes) + "</div>"
 
 
 def payload_original_dict(ordem: OrdemServico) -> dict:
@@ -1339,6 +1367,124 @@ def render_datalist(name: str, options: list[str]) -> str:
         return ""
     itens = "".join(f"<option value='{escape_html(option)}'></option>" for option in options)
     return f"<datalist id='lista-{escape_html(name)}'>{itens}</datalist>"
+
+
+def normalizar_nome_coluna(valor: Any) -> str:
+    texto = to_str(valor).strip().lower()
+    return (
+        texto.replace(" ", "_")
+        .replace("-", "_")
+        .replace("/", "_")
+        .replace("\\", "_")
+        .replace(".", "_")
+        .replace("(", "")
+        .replace(")", "")
+    )
+
+
+def ler_dataframe_importacao(nome_arquivo: str, conteudo: bytes) -> pd.DataFrame:
+    nome = (nome_arquivo or "").strip().lower()
+    if nome.endswith(".csv"):
+        try:
+            return pd.read_csv(io.StringIO(conteudo.decode("utf-8")))
+        except UnicodeDecodeError:
+            return pd.read_csv(io.StringIO(conteudo.decode("latin1")))
+    if nome.endswith(".xlsx") or nome.endswith(".xlsm"):
+        return pd.read_excel(io.BytesIO(conteudo), engine="openpyxl")
+    if nome.endswith(".xls"):
+        return pd.read_excel(io.BytesIO(conteudo), engine="xlrd")
+    raise HTTPException(
+        status_code=400,
+        detail="Arquivo invalido. Envie uma planilha .xls, .xlsx, .xlsm ou .csv.",
+    )
+
+
+def linhas_importacao_placas(nome_arquivo: str, conteudo: bytes) -> list[dict[str, str]]:
+    frame = ler_dataframe_importacao(nome_arquivo, conteudo)
+    frame.columns = [normalizar_nome_coluna(coluna) for coluna in frame.columns]
+
+    obrigatorias = {"placa", "cd_veiculo", "cd_ccusto", "cd_filial"}
+    faltando = [coluna for coluna in obrigatorias if coluna not in frame.columns]
+    if faltando:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "A planilha precisa conter as colunas obrigatorias: placa, cd_veiculo, cd_ccusto e cd_filial. "
+                f"Faltando: {', '.join(sorted(faltando))}."
+            ),
+        )
+
+    linhas: list[dict[str, str]] = []
+    for _, row in frame.iterrows():
+        placa = to_str(row.get("placa", "")).upper()
+        cd_veiculo = to_str(row.get("cd_veiculo", ""))
+        cd_ccusto = to_str(row.get("cd_ccusto", ""))
+        cd_filial = to_str(row.get("cd_filial", ""))
+
+        if not placa:
+            continue
+
+        linhas.append(
+            {
+                "placa": placa,
+                "cd_veiculo": cd_veiculo,
+                "cd_ccusto": cd_ccusto,
+                "cd_filial": cd_filial,
+            }
+        )
+
+    if not linhas:
+        raise HTTPException(status_code=400, detail="A planilha nao possui linhas validas para importar.")
+
+    return linhas
+
+
+def importar_cadastro_placas(db: Session, linhas: list[dict[str, str]]) -> dict[str, int]:
+    inseridas = 0
+    atualizadas = 0
+    ignoradas = 0
+
+    for linha in linhas:
+        placa = linha["placa"].strip().upper()
+        cd_veiculo = linha["cd_veiculo"].strip()
+        cd_ccusto = linha["cd_ccusto"].strip()
+        cd_filial = linha["cd_filial"].strip()
+
+        if not placa:
+            ignoradas += 1
+            continue
+
+        existente = (
+            db.query(CadastroPlaca)
+            .filter(func.upper(CadastroPlaca.placa) == placa)
+            .first()
+        )
+
+        if existente:
+            existente.placa = placa
+            existente.cd_veiculo = cd_veiculo
+            existente.cd_ccusto = cd_ccusto
+            existente.cd_filial = cd_filial
+            existente.deleted_at = None
+            atualizadas += 1
+        else:
+            db.add(
+                CadastroPlaca(
+                    placa=placa,
+                    cd_veiculo=cd_veiculo,
+                    cd_ccusto=cd_ccusto,
+                    cd_filial=cd_filial,
+                )
+            )
+            inseridas += 1
+
+    db.commit()
+    return {
+        "inseridas": inseridas,
+        "atualizadas": atualizadas,
+        "ignoradas": ignoradas,
+        "total": len(linhas),
+    }
 
 
 @app.on_event("startup")
@@ -1703,6 +1849,7 @@ def render_painel(ordens, servicos, filtros: Optional[dict] = None, msg: str = "
     <div class="tabs">
       <button type="button" class="btn tab-button active" data-tab-target="ordens" onclick="switchTab('ordens')">Ordens de Servico</button>
       <button type="button" class="btn tab-button" data-tab-target="servicos" onclick="switchTab('servicos')">Servicos por O.S.</button>
+      <a class="btn tab-button" href="/painel/placas">Cadastro de placas</a>
     </div>
     <div class="tab-panel active" data-tab-panel="ordens">
       <div class="card" style="padding:0;">
@@ -1755,6 +1902,123 @@ def render_painel(ordens, servicos, filtros: Optional[dict] = None, msg: str = "
     </div>
     """
     return html_base("Painel O.S. Corretiva", corpo, msg, auto_refresh_seconds=QUEUE_POLL_SECONDS if fila_ativa else 0)
+
+
+def placas_ativas(db: Session) -> list[CadastroPlaca]:
+    return (
+        db.query(CadastroPlaca)
+        .filter(CadastroPlaca.deleted_at.is_(None))
+        .order_by(CadastroPlaca.placa.asc(), CadastroPlaca.id.asc())
+        .all()
+    )
+
+
+def render_painel_placas(registros: list[CadastroPlaca], msg: str = "") -> str:
+    linhas = ""
+    for registro in registros:
+        linhas += f"""
+        <tr>
+          <td><strong>{registro.id}</strong></td>
+          <td>{escape_html(registro.placa or "")}</td>
+          <td>{escape_html(registro.cd_veiculo or "")}</td>
+          <td>{escape_html(registro.cd_ccusto or "")}</td>
+          <td>{escape_html(registro.cd_filial or "")}</td>
+          <td>{registro.updated_at.strftime('%d/%m/%Y %H:%M') if registro.updated_at else ''}</td>
+          <td>
+            <form method="post" action="/painel/placas/delete/{registro.id}" onsubmit="return confirm('Excluir a placa {escape_html(registro.placa or '')}?');">
+              <button class="btn-red" type="submit">Excluir</button>
+            </form>
+          </td>
+        </tr>
+        """
+
+    corpo = f"""
+    <div class="card">
+      <div class="toolbar">
+        <div>
+          <h2 style="margin:0;">Cadastro de placas</h2>
+          <div class="subtle">Mantenha aqui a base persistente usada pelo aplicativo para sugestao offline e preenchimento automatico.</div>
+        </div>
+        <div class="acoes">
+          <a class="btn btn-gray" href="/painel/ordens-servico">Voltar ao painel</a>
+          <a class="btn btn-blue" href="/panel/placas/export" target="_blank">Exportar JSON</a>
+        </div>
+      </div>
+    </div>
+      <div class="card">
+        <form method="post" action="/painel/placas">
+          <div class="grid">
+          <div>
+            <label>Placa</label>
+            <input name="placa" placeholder="Ex.: TID3J67" required>
+          </div>
+          <div>
+            <label>cd_veiculo</label>
+            <input name="cd_veiculo" placeholder="Ex.: 1796" required>
+          </div>
+          <div>
+            <label>cd_ccusto</label>
+            <input name="cd_ccusto" placeholder="Ex.: 3802" required>
+          </div>
+          <div>
+            <label>cd_filial</label>
+            <input name="cd_filial" placeholder="Ex.: 24" required>
+          </div>
+        </div>
+          <div class="acoes">
+            <button type="submit">Salvar placa</button>
+          </div>
+        </form>
+      </div>
+      <div class="card">
+        <div class="toolbar">
+          <div>
+            <h2 style="margin:0;">Importar planilha</h2>
+            <div class="subtle">Envie a base de placas em .xls, .xlsx ou .csv. A importacao atualiza por placa e reativa registros excluidos.</div>
+          </div>
+        </div>
+        <form method="post" action="/painel/placas/importar" enctype="multipart/form-data">
+          <div class="grid">
+            <div>
+              <label>Arquivo da base</label>
+              <input type="file" name="arquivo" accept=".xls,.xlsx,.xlsm,.csv" required>
+            </div>
+          </div>
+          <div class="small" style="margin-top:10px;">Colunas obrigatorias: <strong>placa</strong>, <strong>cd_veiculo</strong>, <strong>cd_ccusto</strong> e <strong>cd_filial</strong>.</div>
+          <div class="acoes">
+            <button class="btn btn-blue" type="submit">Importar planilha</button>
+          </div>
+        </form>
+      </div>
+      <div class="card" style="padding:0;">
+        <div style="padding:18px 18px 8px;">
+          <div class="toolbar">
+          <div>
+            <h2 style="margin:0;">Base sincronizada</h2>
+            <div class="subtle">O aplicativo baixa esta base ao abrir quando houver internet. Sem internet, continua usando a ultima atualizacao local.</div>
+          </div>
+          <div class="small">{len(registros)} placa(s) cadastrada(s)</div>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>ID</th>
+              <th>Placa</th>
+              <th>cd_veiculo</th>
+              <th>cd_ccusto</th>
+              <th>cd_filial</th>
+              <th>Atualizado em</th>
+              <th>Acao</th>
+            </tr>
+          </thead>
+          <tbody>{linhas if linhas else '<tr><td colspan="7">Nenhuma placa cadastrada ainda.</td></tr>'}</tbody>
+        </table>
+      </div>
+    </div>
+    """
+    return html_base("Cadastro de placas", corpo, msg)
 
 
 # =========================================================
@@ -1902,6 +2166,130 @@ def listar_servicos(status_envio: Optional[str] = Query(None), db: Session = Dep
     if status_envio:
         q = q.filter(ServicoOS.status_envio == status_envio)
     return [{"id": s.id, "status_envio": s.status_envio, "payload": payload_servico_from_model(s), "retorno_envio": s.retorno_envio} for s in q.order_by(ServicoOS.created_at.desc()).all()]
+
+
+@app.get("/panel/placas/export")
+def exportar_placas(db: Session = Depends(get_db)):
+    registros = placas_ativas(db)
+    return {
+        "count": len(registros),
+        "items": [
+            {
+                "id": registro.id,
+                "placa": registro.placa or "",
+                "cd_veiculo": registro.cd_veiculo or "",
+                "cd_ccusto": registro.cd_ccusto or "",
+                "cd_filial": registro.cd_filial or "",
+                "updated_at": registro.updated_at.isoformat() if registro.updated_at else None,
+            }
+            for registro in registros
+        ],
+    }
+
+
+@app.get("/painel/placas", response_class=HTMLResponse)
+def painel_placas(msg: Optional[str] = Query(None), db: Session = Depends(get_db)):
+    return HTMLResponse(render_painel_placas(placas_ativas(db), msg or ""))
+
+
+@app.post("/painel/placas")
+async def salvar_placa(request: Request, db: Session = Depends(get_db)):
+    form = await request.form()
+    placa = str(form.get("placa") or "").strip().upper()
+    cd_veiculo = str(form.get("cd_veiculo") or "").strip()
+    cd_ccusto = str(form.get("cd_ccusto") or "").strip()
+    cd_filial = str(form.get("cd_filial") or "").strip()
+
+    if not placa or not cd_veiculo or not cd_ccusto or not cd_filial:
+        return RedirectResponse(
+            url="/painel/placas?msg=Preencha%20placa,%20cd_veiculo,%20cd_ccusto%20e%20cd_filial",
+            status_code=303,
+        )
+
+    existente = (
+        db.query(CadastroPlaca)
+        .filter(func.upper(CadastroPlaca.placa) == placa)
+        .first()
+    )
+
+    if existente:
+        existente.cd_veiculo = cd_veiculo
+        existente.cd_ccusto = cd_ccusto
+        existente.cd_filial = cd_filial
+        existente.deleted_at = None
+        mensagem = f"Placa {placa} atualizada com sucesso"
+    else:
+        db.add(
+            CadastroPlaca(
+                placa=placa,
+                cd_veiculo=cd_veiculo,
+                cd_ccusto=cd_ccusto,
+                cd_filial=cd_filial,
+            )
+        )
+        mensagem = f"Placa {placa} cadastrada com sucesso"
+
+    db.commit()
+    return RedirectResponse(
+        url=f"/painel/placas?msg={requests.utils.quote(mensagem)}",
+        status_code=303,
+    )
+
+
+@app.post("/painel/placas/importar")
+async def importar_placas_planilha(request: Request, db: Session = Depends(get_db)):
+    form = await request.form()
+    arquivo = form.get("arquivo")
+
+    if arquivo is None or not getattr(arquivo, "filename", ""):
+        return RedirectResponse(
+            url="/painel/placas?msg=Selecione%20uma%20planilha%20para%20importar",
+            status_code=303,
+        )
+
+    nome_arquivo = str(getattr(arquivo, "filename", "") or "").strip()
+    conteudo = await arquivo.read()
+    if not conteudo:
+        return RedirectResponse(
+            url="/painel/placas?msg=O%20arquivo%20enviado%20esta%20vazio",
+            status_code=303,
+        )
+
+    try:
+        linhas = linhas_importacao_placas(nome_arquivo, conteudo)
+        resumo = importar_cadastro_placas(db, linhas)
+        mensagem = (
+            f"Importacao concluida: {resumo['inseridas']} inserida(s), "
+            f"{resumo['atualizadas']} atualizada(s) e {resumo['ignoradas']} ignorada(s)."
+        )
+    except HTTPException as exc:
+        mensagem = to_str(exc.detail, "Falha ao importar planilha")
+    except Exception as exc:
+        logger.exception("Falha ao importar planilha de placas")
+        mensagem = f"Falha ao importar planilha: {to_str(exc, 'erro inesperado')}"
+
+    return RedirectResponse(
+        url=f"/painel/placas?msg={requests.utils.quote(mensagem)}",
+        status_code=303,
+    )
+
+
+@app.post("/painel/placas/delete/{registro_id}")
+def deletar_placa(registro_id: int, db: Session = Depends(get_db)):
+    registro = (
+        db.query(CadastroPlaca)
+        .filter(CadastroPlaca.id == registro_id)
+        .filter(CadastroPlaca.deleted_at.is_(None))
+        .first()
+    )
+    if not registro:
+        raise HTTPException(status_code=404, detail="Placa nao encontrada")
+    registro.deleted_at = func.now()
+    db.commit()
+    return RedirectResponse(
+        url="/painel/placas?msg=Placa%20excluida%20com%20sucesso",
+        status_code=303,
+    )
 
 
 @app.get("/painel/ordens-servico", response_class=HTMLResponse)

@@ -4,6 +4,7 @@ sqlalchemy
 psycopg2-binary
 pandas
 openpyxl
+xlrd
 requests
 python-multipart
 itsdangerous
