@@ -412,6 +412,20 @@ def validar_credenciais_painel(credenciais: dict, *, origem: str) -> None:
         )
 
 
+def limpar_payload_para_painel(valor: Any) -> Any:
+    if isinstance(valor, dict):
+        removidos = {"photos", "fotos", "imagens", "data_base64", "base64", "content_type", "filename"}
+        novo = {}
+        for chave, item in valor.items():
+            if str(chave).lower() in removidos:
+                continue
+            novo[chave] = limpar_payload_para_painel(item)
+        return novo
+    if isinstance(valor, list):
+        return [limpar_payload_para_painel(item) for item in valor if not (isinstance(item, dict) and any(str(k).lower() in {"data_base64", "base64"} for k in item.keys()))]
+    return valor
+
+
 def montar_payload_os(dados: dict) -> dict:
     abertura = pick(dados, "data_hora_abertura", "opening_datetime", "dh_entrada")
     saida = pick(dados, "data_hora_saida", "exit_datetime", "dh_saida")
@@ -518,7 +532,6 @@ def payload_os_from_ordem(o: OrdemServico) -> dict:
         "socorro": bool(o.socorro),
         "servico_retorno": bool(o.servico_retorno),
         "programada": bool(o.programada),
-        "campos_brutos": {},
     }
 
 
@@ -538,7 +551,6 @@ def payload_servico_from_model(s: ServicoOS) -> dict:
         "codigo_recurso_humano": to_str(s.codigo_recurso_humano),
         "tempo_gasto": to_str(s.tempo_gasto, "000:00"),
         "valor_hora": to_str(s.valor_hora, "0"),
-        "campos_brutos": {},
     }
 
 
@@ -1722,6 +1734,7 @@ async def receber_os(request: Request, db: Session = Depends(get_db)):
         raise HTTPException(status_code=400, detail="JSON invalido")
     try:
         p = montar_payload_os(dados)
+        dados_limpos = limpar_payload_para_painel(mascarar_senha(dados))
         if not p["codigo_veiculo"] and not p["placa"]:
             raise HTTPException(status_code=400, detail="Informe codigo_veiculo ou placa")
 
@@ -1741,10 +1754,10 @@ async def receber_os(request: Request, db: Session = Depends(get_db)):
             investimento=p["investimento"], acidente=p["acidente"], socorro=p["socorro"], servico_retorno=p["servico_retorno"], programada=p["programada"],
             status_envio="PENDENTE",
             retorno_envio="O.S. salva no painel. Aguardando envio manual.",
-            payload_original=json_dumps_safe(mascarar_senha(dados)),
+            payload_original=json_dumps_safe(dados_limpos),
             campos_brutos=json_dumps_safe(p["campos_brutos"]),
             fotos_app=json_dumps_safe(fotos_recebidas),
-            app_payload=json_dumps_safe(mascarar_senha(dados)),
+            app_payload=json_dumps_safe(dados_limpos),
         )
         db.add(ordem)
         db.commit()
@@ -1777,6 +1790,7 @@ async def receber_servico(request: Request, db: Session = Depends(get_db)):
 
     try:
         p = montar_payload_servico(dados)
+        dados_limpos = limpar_payload_para_painel(mascarar_senha(dados))
         if not p["numero_os"]:
             raise HTTPException(status_code=400, detail="Informe numero_os")
         if not p["codigo_servico"]:
@@ -1790,7 +1804,7 @@ async def receber_servico(request: Request, db: Session = Depends(get_db)):
             codigo_recurso_humano=p["codigo_recurso_humano"], tempo_gasto=p["tempo_gasto"], valor_hora=p["valor_hora"],
             status_envio="PENDENTE",
             retorno_envio="Servi?o salvo no painel. Aguardando envio manual.",
-            payload_original=json_dumps_safe(mascarar_senha(dados)),
+            payload_original=json_dumps_safe(dados_limpos),
             campos_brutos=json_dumps_safe(p["campos_brutos"]),
         )
         db.add(serv)
