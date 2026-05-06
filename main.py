@@ -1412,6 +1412,22 @@ def html_base(titulo: str, corpo: str, msg: str = "", auto_refresh_seconds: int 
         .table-wrap {{ overflow:auto; }}
         .toolbar {{ display:flex; justify-content:space-between; gap:12px; align-items:center; flex-wrap:wrap; }}
         .toolbar .acoes {{ margin-top:0; }}
+        .tabs {{ display:flex; gap:10px; flex-wrap:wrap; margin-bottom:18px; }}
+        .tab-button {{ background:#e5e7eb; color:#111827; border:1px solid #d1d5db; }}
+        .tab-button.active {{ background:#111827; color:#fff; border-color:#111827; }}
+        .tab-panel {{ display:none; }}
+        .tab-panel.active {{ display:block; }}
+        .service-groups {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(320px,1fr)); gap:16px; }}
+        .service-group-card {{ background:#fff; border:1px solid #e5e7eb; border-radius:14px; padding:16px; box-shadow:0 2px 12px rgba(0,0,0,.05); }}
+        .service-group-header {{ display:flex; justify-content:space-between; gap:12px; align-items:flex-start; margin-bottom:10px; }}
+        .service-group-title {{ font-size:18px; font-weight:800; }}
+        .service-group-meta {{ color:#4b5563; font-size:13px; }}
+        .service-pill {{ display:inline-flex; padding:4px 8px; border-radius:999px; font-size:12px; font-weight:700; background:#eef2ff; color:#3730a3; }}
+        .service-list {{ display:flex; flex-direction:column; gap:10px; margin-top:12px; }}
+        .service-item {{ border:1px solid #e5e7eb; border-radius:12px; padding:12px; }}
+        .service-item-top {{ display:flex; justify-content:space-between; gap:10px; align-items:flex-start; }}
+        .service-item-meta {{ color:#6b7280; font-size:12px; margin-top:6px; }}
+        .service-item-actions {{ display:flex; gap:8px; flex-wrap:wrap; margin-top:10px; }}
         .hint {{ color:#4b5563; font-size:13px; }}
         .check-cell {{ width:38px; text-align:center; }}
         .check-cell input {{ width:16px; height:16px; }}
@@ -1434,6 +1450,15 @@ def html_base(titulo: str, corpo: str, msg: str = "", auto_refresh_seconds: int 
           document.getElementById(hiddenId).value = selected.join(',');
           document.getElementById(formId).submit();
           return false;
+        }}
+
+        function switchTab(tabName) {{
+          document.querySelectorAll('[data-tab-target]').forEach((button) => {{
+            button.classList.toggle('active', button.getAttribute('data-tab-target') === tabName);
+          }});
+          document.querySelectorAll('[data-tab-panel]').forEach((panel) => {{
+            panel.classList.toggle('active', panel.getAttribute('data-tab-panel') === tabName);
+          }});
         }}
       </script>
     </head>
@@ -1562,26 +1587,65 @@ def render_painel(ordens, servicos, filtros: Optional[dict] = None, msg: str = "
         </tr>
         """
 
-    linhas_serv = ""
+    servicos_agrupados: dict[str, list[Any]] = {}
     for s in servicos:
-        st = s.status_envio or "PENDENTE"
-        retorno_html = retorno_resumido_html(s.retorno_envio or "", f"/painel/detalhes/servico/{s.id}", success=st == "ENVIADA")
-        if st == "ENVIADA":
-            acao = "<span class='status-enviada'>Enviado</span>"
-        elif st in ("EM_FILA", "PROCESSANDO"):
-            acao = "<span class='status-pendente'>Enviando</span>"
-        else:
-            acao = f"""
-            <form method="post" action="/painel/servicos-os/enviar/{s.id}" onsubmit="return confirm('Enviar o servico {s.id} agora ao FrotaWeb?')">
-              <button class="btn-green" type="submit">Enviar agora</button>
-            </form>
+        chave = str(s.numero_os or "").strip() or "SEM_OS"
+        servicos_agrupados.setdefault(chave, []).append(s)
+
+    grupos_servicos_html = ""
+    for numero_os, lista in sorted(
+        servicos_agrupados.items(),
+        key=lambda item: (
+            item[0] == "SEM_OS",
+            item[0],
+        ),
+    ):
+        primeira = lista[0]
+        enviados = sum(1 for item in lista if (item.status_envio or "") == "ENVIADA")
+        erros = sum(1 for item in lista if str(item.status_envio or "").startswith("ERRO"))
+        pendentes = len(lista) - enviados - erros
+        lista_html = ""
+        for s in lista:
+            st = s.status_envio or "PENDENTE"
+            retorno_html = retorno_resumido_html(s.retorno_envio or "", f"/painel/detalhes/servico/{s.id}", success=st == "ENVIADA")
+            if st == "ENVIADA":
+                acao = "<span class='status-enviada'>Enviado</span>"
+            elif st in ("EM_FILA", "PROCESSANDO"):
+                acao = "<span class='status-pendente'>Enviando</span>"
+            else:
+                acao = f"""
+                <form method="post" action="/painel/servicos-os/enviar/{s.id}" onsubmit="return confirm('Enviar o servico {s.id} agora ao FrotaWeb?')">
+                  <button class="btn-green" type="submit">Enviar agora</button>
+                </form>
+                """
+            lista_html += f"""
+            <div class="service-item">
+              <div class="service-item-top">
+                <div>
+                  <div><strong>Servico {escape_html(s.codigo_servico or '')}</strong> <span class="{status_class(st)}">{st}</span></div>
+                  <div class="service-item-meta">ID {s.id} | Veiculo {escape_html(s.codigo_veiculo or '')} | Placa {escape_html(s.placa or '')}</div>
+                  <div class="service-item-meta">Recurso {escape_html(s.codigo_recurso_humano or '')} | Tempo {escape_html(s.tempo_gasto or '')} | Valor hora {escape_html(s.valor_hora or '')}</div>
+                </div>
+                <input type="checkbox" class="servico-checkbox" value="{s.id}">
+              </div>
+              <div style="margin-top:10px;">{retorno_html}</div>
+              <div class="service-item-actions">
+                {acao}
+                <a class="btn btn-blue" href="/painel/detalhes/servico/{s.id}" target="_blank">Ver detalhes</a>
+              </div>
+            </div>
             """
-        linhas_serv += f"""
-        <tr>
-          <td class="check-cell"><input type="checkbox" class="servico-checkbox" value="{s.id}"></td><td><strong>#{s.id}</strong></td><td><span class="{status_class(st)}">{st}</span></td><td>{escape_html(s.numero_os or '')}</td><td>{escape_html(s.codigo_veiculo or '')}</td><td>{escape_html(s.placa or '')}</td>
-          <td>{escape_html(s.codigo_servico or '')}</td><td>{escape_html(s.codigo_recurso_humano or '')}</td><td>{escape_html(s.tempo_gasto or '')}</td><td>{escape_html(s.valor_hora or '')}</td>
-          <td class="retorno">{retorno_html}</td><td>{s.created_at.strftime('%d/%m/%Y %H:%M') if s.created_at else ''}</td><td>{acao}</td>
-        </tr>
+        grupos_servicos_html += f"""
+        <div class="service-group-card">
+          <div class="service-group-header">
+            <div>
+              <div class="service-group-title">O.S. {escape_html(numero_os if numero_os != 'SEM_OS' else 'Sem vinculacao')}</div>
+              <div class="service-group-meta">Veiculo {escape_html(primeira.codigo_veiculo or '')} | Placa {escape_html(primeira.placa or '')}</div>
+            </div>
+            <div class="service-pill">{enviados}/{len(lista)} enviados | {erros} erro(s) | {pendentes} pendente(s)</div>
+          </div>
+          <div class="service-list">{lista_html}</div>
+        </div>
         """
 
     def fv(nome: str) -> str:
@@ -1636,52 +1700,57 @@ def render_painel(ordens, servicos, filtros: Optional[dict] = None, msg: str = "
         </div>
       </form>
     </div>
-    <div class="card" style="padding:0;">
-      <div style="padding:18px 18px 8px;">
-        <div class="toolbar">
-          <div>
-            <h2 style="margin:0;">Ordens de Serviço</h2>
-            <div class="subtle">O painel funciona como fila operacional: envie direto ao FrotaWeb, acompanhe o resultado e abra o historico quando precisar.</div>
-          </div>
-          <div class="acoes">
-            <form id="bulk-queue-os-form" method="post" action="/painel/ordens-servico/enviar-lote">
-              <input type="hidden" id="bulk-queue-os-ids" name="ids">
-              <button type="button" class="btn-green" onclick="submitSelected('bulk-queue-os-form', '.ordem-checkbox', 'bulk-queue-os-ids', 'Selecione ao menos uma O.S. para enfileirar.', 'Colocar {{count}} O.S. selecionada(s) na fila?')">Enviar selecionadas</button>
-            </form>
-            <form id="bulk-delete-os-form" method="post" action="/painel/ordens-servico/deletar-lote">
-              <input type="hidden" id="bulk-delete-os-ids" name="ids">
-              <button type="button" class="btn-red" onclick="submitSelected('bulk-delete-os-form', '.ordem-checkbox', 'bulk-delete-os-ids', 'Selecione ao menos uma O.S. para excluir.', 'Excluir {{count}} O.S. selecionada(s)?')">Excluir selecionadas</button>
-            </form>
+    <div class="tabs">
+      <button type="button" class="btn tab-button active" data-tab-target="ordens" onclick="switchTab('ordens')">Ordens de Servico</button>
+      <button type="button" class="btn tab-button" data-tab-target="servicos" onclick="switchTab('servicos')">Servicos por O.S.</button>
+    </div>
+    <div class="tab-panel active" data-tab-panel="ordens">
+      <div class="card" style="padding:0;">
+        <div style="padding:18px 18px 8px;">
+          <div class="toolbar">
+            <div>
+              <h2 style="margin:0;">Ordens de Servico</h2>
+              <div class="subtle">Acompanhe as O.S. principais e deixe os servicos em uma consulta separada, mais limpa para o dia a dia.</div>
+            </div>
+            <div class="acoes">
+              <form id="bulk-queue-os-form" method="post" action="/painel/ordens-servico/enviar-lote">
+                <input type="hidden" id="bulk-queue-os-ids" name="ids">
+                <button type="button" class="btn-green" onclick="submitSelected('bulk-queue-os-form', '.ordem-checkbox', 'bulk-queue-os-ids', 'Selecione ao menos uma O.S. para enviar.', 'Enviar {{count}} O.S. selecionada(s)?')">Enviar selecionadas</button>
+              </form>
+              <form id="bulk-delete-os-form" method="post" action="/painel/ordens-servico/deletar-lote">
+                <input type="hidden" id="bulk-delete-os-ids" name="ids">
+                <button type="button" class="btn-red" onclick="submitSelected('bulk-delete-os-form', '.ordem-checkbox', 'bulk-delete-os-ids', 'Selecione ao menos uma O.S. para excluir.', 'Excluir {{count}} O.S. selecionada(s)?')">Excluir selecionadas</button>
+              </form>
+            </div>
           </div>
         </div>
-      </div>
-      <div class="table-wrap">
-        <table><thead><tr><th class="check-cell"><input type="checkbox" onclick="toggleGroup('.ordem-checkbox', this.checked)"></th><th>ID Painel</th><th>Status</th><th>Nº O.S. FrotaWeb</th><th>Serviços</th><th>Veículo</th><th>Placa</th><th>KM</th><th>Abertura</th><th>Saída</th><th>Filial</th><th>Departamento</th><th>Defeito</th><th>Fotos</th><th>Retorno</th><th>Criado em</th><th>Ação</th></tr></thead>
-        <tbody>{linhas_os if linhas_os else '<tr><td colspan="17">Nenhuma O.S. encontrada</td></tr>'}</tbody></table>
+        <div class="table-wrap">
+          <table><thead><tr><th class="check-cell"><input type="checkbox" onclick="toggleGroup('.ordem-checkbox', this.checked)"></th><th>ID Painel</th><th>Status</th><th>N? O.S. FrotaWeb</th><th>Servicos</th><th>Veiculo</th><th>Placa</th><th>KM</th><th>Abertura</th><th>Saida</th><th>Filial</th><th>Departamento</th><th>Defeito</th><th>Fotos</th><th>Retorno</th><th>Criado em</th><th>Acao</th></tr></thead>
+          <tbody>{linhas_os if linhas_os else '<tr><td colspan="17">Nenhuma O.S. encontrada</td></tr>'}</tbody></table>
+        </div>
       </div>
     </div>
-    <div class="card" style="padding:0;">
-      <div style="padding:18px 18px 8px;">
+    <div class="tab-panel" data-tab-panel="servicos">
+      <div class="card">
         <div class="toolbar">
           <div>
-            <h2 style="margin:0;">Serviços da O.S.</h2>
-            <div class="subtle">Serviços com erro mostram a mensagem do FrotaWeb sem expor senha ou payload bruto.</div>
+            <h2 style="margin:0;">Servicos por O.S.</h2>
+            <div class="subtle">Cada card agrupa os servicos enviados para a mesma O.S., facilitando a conferencia sem deixar a tela principal poluida.</div>
           </div>
           <div class="acoes">
-                        <form id="bulk-queue-serv-form" method="post" action="/painel/servicos-os/enviar-lote">
+            <form id="bulk-queue-serv-form" method="post" action="/painel/servicos-os/enviar-lote">
               <input type="hidden" id="bulk-queue-serv-ids" name="ids">
-              <button type="button" class="btn-green" onclick="submitSelected('bulk-queue-serv-form', '.servico-checkbox', 'bulk-queue-serv-ids', 'Selecione ao menos um servico para enfileirar.', 'Colocar {{count}} servico(s) selecionado(s) na fila?')">Enviar selecionados</button>
+              <button type="button" class="btn-green" onclick="submitSelected('bulk-queue-serv-form', '.servico-checkbox', 'bulk-queue-serv-ids', 'Selecione ao menos um servico para enviar.', 'Enviar {{count}} servico(s) selecionado(s)?')">Enviar selecionados</button>
             </form>
             <form id="bulk-delete-serv-form" method="post" action="/painel/servicos-os/deletar-lote">
               <input type="hidden" id="bulk-delete-serv-ids" name="ids">
-              <button type="button" class="btn-red" onclick="submitSelected('bulk-delete-serv-form', '.servico-checkbox', 'bulk-delete-serv-ids', 'Selecione ao menos um serviço para excluir.', 'Excluir {{count}} serviço(s) selecionado(s)?')">Excluir selecionados</button>
+              <button type="button" class="btn-red" onclick="submitSelected('bulk-delete-serv-form', '.servico-checkbox', 'bulk-delete-serv-ids', 'Selecione ao menos um servico para excluir.', 'Excluir {{count}} servico(s) selecionado(s)?')">Excluir selecionados</button>
             </form>
           </div>
         </div>
       </div>
-      <div class="table-wrap">
-        <table><thead><tr><th class="check-cell"><input type="checkbox" onclick="toggleGroup('.servico-checkbox', this.checked)"></th><th>ID</th><th>Status</th><th>Nº O.S.</th><th>Veículo</th><th>Placa</th><th>Cód. Serviço</th><th>Recurso</th><th>Tempo</th><th>Valor Hora</th><th>Retorno</th><th>Criado em</th><th>Ação</th></tr></thead>
-        <tbody>{linhas_serv if linhas_serv else '<tr><td colspan="13">Nenhum serviço encontrado</td></tr>'}</tbody></table>
+      <div class="service-groups">
+        {grupos_servicos_html if grupos_servicos_html else '<div class="card">Nenhum servico encontrado.</div>'}
       </div>
     </div>
     """
