@@ -3,11 +3,12 @@ import json
 import base64
 import logging
 import time
+import threading
 from typing import Any, Generator, Optional
 from datetime import datetime
 
 import requests
-from fastapi import FastAPI, Depends, Request, HTTPException, Query, BackgroundTasks
+from fastapi import FastAPI, Depends, Request, HTTPException, Query
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, Text, Boolean, func, text
@@ -48,6 +49,7 @@ HTTP_RETRY_BACKOFF_SECONDS = max(1, int(os.getenv("HTTP_RETRY_BACKOFF_SECONDS", 
 HTTP_RETRYABLE_STATUS_CODES = {429, 502, 503, 504}
 HTTP_WAKEUP_ENABLED = str(os.getenv("HTTP_WAKEUP_ENABLED", "true")).strip().lower() in ("1", "true", "yes", "on")
 HTTP_WAKEUP_DELAY_SECONDS = max(1, int(os.getenv("HTTP_WAKEUP_DELAY_SECONDS", "3")))
+QUEUE_POLL_SECONDS = max(2, int(os.getenv("QUEUE_POLL_SECONDS", "5")))
 
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -63,6 +65,10 @@ app = FastAPI(
 UPLOAD_DIR = os.getenv("UPLOAD_DIR", "uploads/fotos")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 app.mount("/fotos", StaticFiles(directory=UPLOAD_DIR), name="fotos")
+
+worker_stop_event = threading.Event()
+worker_thread: Optional[threading.Thread] = None
+worker_lock = threading.Lock()
 
 # =========================================================
 # DATABASE
@@ -913,6 +919,56 @@ def processar_ordem_em_fila(ordem_id: int) -> None:
         db.close()
 
 
+def processar_proximo_item_da_fila() -> bool:
+    with worker_lock:
+        db = SessionLocal()
+        try:
+            ordem = (
+                db.query(OrdemServico)
+                .filter(OrdemServico.deleted_at.is_(None))
+                .filter(OrdemServico.status_envio == "EM_FILA")
+                .order_by(OrdemServico.created_at.asc(), OrdemServico.id.asc())
+                .first()
+            )
+            if ordem:
+                ordem_id = ordem.id
+                db.expunge(ordem)
+                db.close()
+                processar_ordem_em_fila(ordem_id)
+                return True
+
+            servico = (
+                db.query(ServicoOS)
+                .filter(ServicoOS.deleted_at.is_(None))
+                .filter(ServicoOS.status_envio == "EM_FILA")
+                .order_by(ServicoOS.created_at.asc(), ServicoOS.id.asc())
+                .first()
+            )
+            if servico:
+                servico_id = servico.id
+                db.expunge(servico)
+                db.close()
+                processar_servico_em_fila(servico_id)
+                return True
+            return False
+        finally:
+            if db.is_active:
+                db.close()
+
+
+def loop_worker_fila() -> None:
+    logger.info("Worker da fila iniciado com polling de %ss", QUEUE_POLL_SECONDS)
+    while not worker_stop_event.is_set():
+        try:
+            processou = processar_proximo_item_da_fila()
+            if processou:
+                continue
+        except Exception:
+            logger.exception("Falha inesperada no worker da fila")
+        worker_stop_event.wait(QUEUE_POLL_SECONDS)
+    logger.info("Worker da fila encerrado")
+
+
 def status_class(status: str) -> str:
     if status == "ENVIADA":
         return "status-enviada"
@@ -1264,17 +1320,33 @@ def render_datalist(name: str, options: list[str]) -> str:
     return f"<datalist id='lista-{escape_html(name)}'>{itens}</datalist>"
 
 
+@app.on_event("startup")
+def startup_worker() -> None:
+    global worker_thread
+    worker_stop_event.clear()
+    if worker_thread and worker_thread.is_alive():
+        return
+    worker_thread = threading.Thread(target=loop_worker_fila, name="painel-os-worker", daemon=True)
+    worker_thread.start()
+
+
+@app.on_event("shutdown")
+def shutdown_worker() -> None:
+    worker_stop_event.set()
+
+
 # =========================================================
 # HTML
 # =========================================================
 
-def html_base(titulo: str, corpo: str, msg: str = "") -> str:
+def html_base(titulo: str, corpo: str, msg: str = "", auto_refresh_seconds: int = 0) -> str:
     return f"""
     <!DOCTYPE html>
     <html lang="pt-BR">
     <head>
       <meta charset="UTF-8">
       <meta name="viewport" content="width=device-width, initial-scale=1.0">
+      {f'<meta http-equiv="refresh" content="{auto_refresh_seconds}">' if auto_refresh_seconds else ''}
       <title>{titulo}</title>
       <style>
         body {{ font-family: Arial, sans-serif; background:#f3f4f6; margin:0; padding:24px; color:#111827; }}
@@ -1391,6 +1463,10 @@ def render_painel(ordens, servicos, filtros: Optional[dict] = None, msg: str = "
     total_enviadas = len([o for o in ordens_filtradas if (o.status_envio or '') == 'ENVIADA'])
     total_erros = len([o for o in ordens_filtradas if str(o.status_envio or '').startswith('ERRO')])
     total_fotos = len([o for o in ordens_filtradas if fotos_da_ordem(o)])
+    fila_ativa = any((o.status_envio or "") in ("EM_FILA", "PROCESSANDO") for o in ordens) or any(
+        (s.status_envio or "") in ("EM_FILA", "PROCESSANDO") for s in servicos
+    )
+    worker_status = "Ativo" if worker_thread and worker_thread.is_alive() else "Parado"
 
     datalists = {
         "id": render_datalist("id", unique_suggestions([o.id for o in ordens])),
@@ -1497,7 +1573,9 @@ def render_painel(ordens, servicos, filtros: Optional[dict] = None, msg: str = "
       <div class="kpi"><div class="label">Enviadas</div><div class="value">{total_enviadas}</div></div>
       <div class="kpi"><div class="label">Com erro</div><div class="value">{total_erros}</div></div>
       <div class="kpi"><div class="label">Com foto</div><div class="value">{total_fotos}</div></div>
+      <div class="kpi"><div class="label">Worker da fila</div><div class="value" style="font-size:22px;">{worker_status}</div></div>
     </div>
+    {f'<div class="card"><strong>Fila em andamento.</strong> Esta tela atualiza sozinha a cada {QUEUE_POLL_SECONDS}s.</div>' if fila_ativa else ''}
     <div class="card">
       <form method="get" action="/painel/ordens-servico">
         <div class="hint" style="margin-bottom:12px;">Digite parte do valor e escolha uma sugestão da própria base do painel.</div>
@@ -1586,7 +1664,7 @@ def render_painel(ordens, servicos, filtros: Optional[dict] = None, msg: str = "
       </div>
     </div>
     """
-    return html_base("Painel O.S. Corretiva", corpo, msg)
+    return html_base("Painel O.S. Corretiva", corpo, msg, auto_refresh_seconds=QUEUE_POLL_SECONDS if fila_ativa else 0)
 
 
 # =========================================================
@@ -1600,7 +1678,30 @@ def home():
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    db = SessionLocal()
+    try:
+        ordens_em_fila = db.query(OrdemServico).filter(OrdemServico.deleted_at.is_(None)).filter(OrdemServico.status_envio.in_(("EM_FILA", "PROCESSANDO"))).count()
+        servicos_em_fila = db.query(ServicoOS).filter(ServicoOS.deleted_at.is_(None)).filter(ServicoOS.status_envio.in_(("EM_FILA", "PROCESSANDO"))).count()
+        return {
+            "status": "ok",
+            "worker_alive": bool(worker_thread and worker_thread.is_alive()),
+            "queue_poll_seconds": QUEUE_POLL_SECONDS,
+            "ordens_em_fila": ordens_em_fila,
+            "servicos_em_fila": servicos_em_fila,
+        }
+    finally:
+        db.close()
+
+
+@app.post("/painel/processar-fila-agora")
+def processar_fila_agora():
+    try:
+        processou = processar_proximo_item_da_fila()
+        mensagem = "Fila processada agora." if processou else "Nao havia item em fila para processar."
+    except Exception as exc:
+        logger.exception("Falha ao processar fila manualmente")
+        mensagem = f"Falha ao processar fila: {exc}"
+    return RedirectResponse(url=f"/painel/ordens-servico?msg={requests.utils.quote(mensagem)}", status_code=303)
 
 
 @app.post("/panel/os")
@@ -1900,7 +2001,6 @@ async def deletar_ordens_lote(request: Request, db: Session = Depends(get_db)):
 @app.post("/painel/ordens-servico/enviar-lote")
 async def enfileirar_ordens_lote(
     request: Request,
-    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
 ):
     form = await request.form()
@@ -1915,7 +2015,6 @@ async def enfileirar_ordens_lote(
             continue
         ordem.status_envio = "EM_FILA"
         ordem.retorno_envio = "O.S. colocada na fila de envio. O painel vai processar em segundo plano."
-        background_tasks.add_task(processar_ordem_em_fila, ordem.id)
         total += 1
 
     db.commit()
@@ -1940,7 +2039,6 @@ async def deletar_servicos_lote(request: Request, db: Session = Depends(get_db))
 @app.post("/painel/servicos-os/enviar-lote")
 async def enfileirar_servicos_lote(
     request: Request,
-    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
 ):
     form = await request.form()
@@ -1955,7 +2053,6 @@ async def enfileirar_servicos_lote(
             continue
         serv.status_envio = "EM_FILA"
         serv.retorno_envio = "Servico colocado na fila de envio. O painel vai processar em segundo plano."
-        background_tasks.add_task(processar_servico_em_fila, serv.id)
         total += 1
 
     db.commit()
@@ -2043,7 +2140,7 @@ def ver_detalhes_retorno(tipo: str, registro_id: int, db: Session = Depends(get_
 
 
 @app.post("/painel/ordens-servico/enviar/{ordem_id}")
-def enviar_os(ordem_id: int, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+def enviar_os(ordem_id: int, db: Session = Depends(get_db)):
     ordem = db.query(OrdemServico).filter(OrdemServico.id == ordem_id).filter(OrdemServico.deleted_at.is_(None)).first()
     if not ordem:
         raise HTTPException(status_code=404, detail="O.S. nao encontrada")
@@ -2051,12 +2148,11 @@ def enviar_os(ordem_id: int, background_tasks: BackgroundTasks, db: Session = De
     ordem.status_envio = "EM_FILA"
     ordem.retorno_envio = "O.S. colocada na fila de envio. O painel vai processar em segundo plano."
     db.commit()
-    background_tasks.add_task(processar_ordem_em_fila, ordem.id)
     return RedirectResponse(url=f"/painel/ordens-servico?msg=O.S.%20{ordem.id}%20colocada%20na%20fila%20de%20envio", status_code=303)
 
 
 @app.post("/painel/servicos-os/enviar/{servico_id}")
-def enviar_servico(servico_id: int, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+def enviar_servico(servico_id: int, db: Session = Depends(get_db)):
     serv = db.query(ServicoOS).filter(ServicoOS.id == servico_id).filter(ServicoOS.deleted_at.is_(None)).first()
     if not serv:
         raise HTTPException(status_code=404, detail="Servico nao encontrado")
@@ -2064,7 +2160,6 @@ def enviar_servico(servico_id: int, background_tasks: BackgroundTasks, db: Sessi
     serv.status_envio = "EM_FILA"
     serv.retorno_envio = "Servico colocado na fila de envio. O painel vai processar em segundo plano."
     db.commit()
-    background_tasks.add_task(processar_servico_em_fila, serv.id)
     return RedirectResponse(url=f"/painel/ordens-servico?msg=Servico%20{serv.id}%20colocado%20na%20fila%20de%20envio", status_code=303)
 
 
