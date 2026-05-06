@@ -957,7 +957,7 @@ def processar_proximo_item_da_fila() -> bool:
 
 
 def loop_worker_fila() -> None:
-    logger.info("Worker da fila iniciado com polling de %ss", QUEUE_POLL_SECONDS)
+    logger.info("Modo de envio iniciado com polling de %ss", QUEUE_POLL_SECONDS)
     while not worker_stop_event.is_set():
         try:
             processou = processar_proximo_item_da_fila()
@@ -966,7 +966,16 @@ def loop_worker_fila() -> None:
         except Exception:
             logger.exception("Falha inesperada no worker da fila")
         worker_stop_event.wait(QUEUE_POLL_SECONDS)
-    logger.info("Worker da fila encerrado")
+    logger.info("Modo de envio encerrado")
+
+
+def resumo_resultado_envio(status_envio: str, retorno_envio: str, prefixo_ok: str, prefixo_erro: str) -> str:
+    mensagem = mensagem_frotaweb(retorno_envio, "")
+    if status_envio == "ENVIADA":
+        return f"{prefixo_ok} {mensagem}".strip()
+    if mensagem:
+        return f"{prefixo_erro} {mensagem}".strip()
+    return prefixo_erro
 
 
 def status_class(status: str) -> str:
@@ -1466,7 +1475,7 @@ def render_painel(ordens, servicos, filtros: Optional[dict] = None, msg: str = "
     fila_ativa = any((o.status_envio or "") in ("EM_FILA", "PROCESSANDO") for o in ordens) or any(
         (s.status_envio or "") in ("EM_FILA", "PROCESSANDO") for s in servicos
     )
-    worker_status = "Ativo" if worker_thread and worker_thread.is_alive() else "Parado"
+    worker_status = "Imediato"
 
     datalists = {
         "id": render_datalist("id", unique_suggestions([o.id for o in ordens])),
@@ -1510,11 +1519,11 @@ def render_painel(ordens, servicos, filtros: Optional[dict] = None, msg: str = "
         if st == "ENVIADA":
             acoes += "<span class='status-enviada'>O.S. enviada</span>"
         elif st in ("EM_FILA", "PROCESSANDO"):
-            acoes += "<span class='status-pendente'>Fila em andamento</span>"
+            acoes += "<span class='status-pendente'>Enviando</span>"
         else:
             acoes += f"""
-            <form method="post" action="/painel/ordens-servico/enviar/{o.id}" onsubmit="return confirm('Colocar a O.S. {o.id} na fila de envio?')">
-              <button class="btn-green" type="submit">Colocar na fila</button>
+            <form method="post" action="/painel/ordens-servico/enviar/{o.id}" onsubmit="return confirm('Enviar a O.S. {o.id} agora ao FrotaWeb?')">
+              <button class="btn-green" type="submit">Enviar agora</button>
             </form>
             """
         acoes += "</div>"
@@ -1548,11 +1557,11 @@ def render_painel(ordens, servicos, filtros: Optional[dict] = None, msg: str = "
         if st == "ENVIADA":
             acao = "<span class='status-enviada'>Enviado</span>"
         elif st in ("EM_FILA", "PROCESSANDO"):
-            acao = "<span class='status-pendente'>Fila em andamento</span>"
+            acao = "<span class='status-pendente'>Enviando</span>"
         else:
             acao = f"""
-            <form method="post" action="/painel/servicos-os/enviar/{s.id}" onsubmit="return confirm('Colocar o servico {s.id} na fila de envio?')">
-              <button class="btn-green" type="submit">Colocar na fila</button>
+            <form method="post" action="/painel/servicos-os/enviar/{s.id}" onsubmit="return confirm('Enviar o servico {s.id} agora ao FrotaWeb?')">
+              <button class="btn-green" type="submit">Enviar agora</button>
             </form>
             """
         linhas_serv += f"""
@@ -1573,9 +1582,9 @@ def render_painel(ordens, servicos, filtros: Optional[dict] = None, msg: str = "
       <div class="kpi"><div class="label">Enviadas</div><div class="value">{total_enviadas}</div></div>
       <div class="kpi"><div class="label">Com erro</div><div class="value">{total_erros}</div></div>
       <div class="kpi"><div class="label">Com foto</div><div class="value">{total_fotos}</div></div>
-      <div class="kpi"><div class="label">Worker da fila</div><div class="value" style="font-size:22px;">{worker_status}</div></div>
+      <div class="kpi"><div class="label">Modo de envio</div><div class="value" style="font-size:22px;">{worker_status}</div></div>
     </div>
-    {f'<div class="card"><strong>Fila em andamento.</strong> Esta tela atualiza sozinha a cada {QUEUE_POLL_SECONDS}s.</div>' if fila_ativa else ''}
+    {f'<div class="card"><strong>Enviando.</strong> O painel esta processando um envio agora.</div>' if fila_ativa else ''}
     <div class="card">
       <form method="get" action="/painel/ordens-servico">
         <div class="hint" style="margin-bottom:12px;">Digite parte do valor e escolha uma sugestão da própria base do painel.</div>
@@ -1620,12 +1629,12 @@ def render_painel(ordens, servicos, filtros: Optional[dict] = None, msg: str = "
         <div class="toolbar">
           <div>
             <h2 style="margin:0;">Ordens de Serviço</h2>
-            <div class="subtle">O painel funciona como fila operacional: clique para enfileirar, acompanhe o processamento e abra o historico quando precisar.</div>
+            <div class="subtle">O painel funciona como fila operacional: envie direto ao FrotaWeb, acompanhe o resultado e abra o historico quando precisar.</div>
           </div>
           <div class="acoes">
             <form id="bulk-queue-os-form" method="post" action="/painel/ordens-servico/enviar-lote">
               <input type="hidden" id="bulk-queue-os-ids" name="ids">
-              <button type="button" class="btn-green" onclick="submitSelected('bulk-queue-os-form', '.ordem-checkbox', 'bulk-queue-os-ids', 'Selecione ao menos uma O.S. para enfileirar.', 'Colocar {{count}} O.S. selecionada(s) na fila?')">Enfileirar selecionadas</button>
+              <button type="button" class="btn-green" onclick="submitSelected('bulk-queue-os-form', '.ordem-checkbox', 'bulk-queue-os-ids', 'Selecione ao menos uma O.S. para enfileirar.', 'Colocar {{count}} O.S. selecionada(s) na fila?')">Enviar selecionadas</button>
             </form>
             <form id="bulk-delete-os-form" method="post" action="/painel/ordens-servico/deletar-lote">
               <input type="hidden" id="bulk-delete-os-ids" name="ids">
@@ -1649,7 +1658,7 @@ def render_painel(ordens, servicos, filtros: Optional[dict] = None, msg: str = "
           <div class="acoes">
                         <form id="bulk-queue-serv-form" method="post" action="/painel/servicos-os/enviar-lote">
               <input type="hidden" id="bulk-queue-serv-ids" name="ids">
-              <button type="button" class="btn-green" onclick="submitSelected('bulk-queue-serv-form', '.servico-checkbox', 'bulk-queue-serv-ids', 'Selecione ao menos um servico para enfileirar.', 'Colocar {{count}} servico(s) selecionado(s) na fila?')">Enfileirar selecionados</button>
+              <button type="button" class="btn-green" onclick="submitSelected('bulk-queue-serv-form', '.servico-checkbox', 'bulk-queue-serv-ids', 'Selecione ao menos um servico para enfileirar.', 'Colocar {{count}} servico(s) selecionado(s) na fila?')">Enviar selecionados</button>
             </form>
             <form id="bulk-delete-serv-form" method="post" action="/painel/servicos-os/deletar-lote">
               <input type="hidden" id="bulk-delete-serv-ids" name="ids">
@@ -2010,15 +2019,34 @@ async def enfileirar_ordens_lote(
 
     ordens = db.query(OrdemServico).filter(OrdemServico.id.in_(ids)).filter(OrdemServico.deleted_at.is_(None)).all()
     total = 0
+    sucesso = 0
+    erro = 0
+    ordem_ids = []
     for ordem in ordens:
-        if ordem.status_envio in ("ENVIADA", "EM_FILA", "PROCESSANDO"):
+        if ordem.status_envio == "ENVIADA":
             continue
-        ordem.status_envio = "EM_FILA"
-        ordem.retorno_envio = "O.S. colocada na fila de envio. O painel vai processar em segundo plano."
+        ordem.status_envio = "PROCESSANDO"
+        ordem.retorno_envio = "Enviando O.S. ao FrotaWeb..."
+        ordem_ids.append(ordem.id)
         total += 1
-
     db.commit()
-    return RedirectResponse(url=f"/painel/ordens-servico?msg={total}%20O.S.%20colocada(s)%20na%20fila", status_code=303)
+
+    for ordem_id in ordem_ids:
+        processar_ordem_em_fila(ordem_id)
+
+    for ordem_id in ordem_ids:
+        atual = db.query(OrdemServico).filter(OrdemServico.id == ordem_id).first()
+        if atual and atual.status_envio == "ENVIADA":
+            sucesso += 1
+        else:
+            erro += 1
+
+    mensagem = f"{sucesso} O.S. enviada(s) com sucesso"
+    if erro:
+        mensagem += f" e {erro} com erro"
+    if total == 0:
+        mensagem = "Nenhuma O.S. elegivel para envio"
+    return RedirectResponse(url=f"/painel/ordens-servico?msg={requests.utils.quote(mensagem)}", status_code=303)
 
 
 @app.post("/painel/servicos-os/deletar-lote")
@@ -2048,15 +2076,34 @@ async def enfileirar_servicos_lote(
 
     servicos = db.query(ServicoOS).filter(ServicoOS.id.in_(ids)).filter(ServicoOS.deleted_at.is_(None)).all()
     total = 0
+    sucesso = 0
+    erro = 0
+    servico_ids = []
     for serv in servicos:
-        if serv.status_envio in ("ENVIADA", "EM_FILA", "PROCESSANDO"):
+        if serv.status_envio == "ENVIADA":
             continue
-        serv.status_envio = "EM_FILA"
-        serv.retorno_envio = "Servico colocado na fila de envio. O painel vai processar em segundo plano."
+        serv.status_envio = "PROCESSANDO"
+        serv.retorno_envio = "Enviando servico ao FrotaWeb..."
+        servico_ids.append(serv.id)
         total += 1
-
     db.commit()
-    return RedirectResponse(url=f"/painel/ordens-servico?msg={total}%20servico(s)%20colocado(s)%20na%20fila", status_code=303)
+
+    for servico_id in servico_ids:
+        processar_servico_em_fila(servico_id)
+
+    for servico_id in servico_ids:
+        atual = db.query(ServicoOS).filter(ServicoOS.id == servico_id).first()
+        if atual and atual.status_envio == "ENVIADA":
+            sucesso += 1
+        else:
+            erro += 1
+
+    mensagem = f"{sucesso} servico(s) enviado(s) com sucesso"
+    if erro:
+        mensagem += f" e {erro} com erro"
+    if total == 0:
+        mensagem = "Nenhum servico elegivel para envio"
+    return RedirectResponse(url=f"/painel/ordens-servico?msg={requests.utils.quote(mensagem)}", status_code=303)
 
 
 @app.post("/painel/ordens-servico/limpar-cache")
@@ -2145,10 +2192,13 @@ def enviar_os(ordem_id: int, db: Session = Depends(get_db)):
     if not ordem:
         raise HTTPException(status_code=404, detail="O.S. nao encontrada")
 
-    ordem.status_envio = "EM_FILA"
-    ordem.retorno_envio = "O.S. colocada na fila de envio. O painel vai processar em segundo plano."
+    ordem.status_envio = "PROCESSANDO"
+    ordem.retorno_envio = "Enviando O.S. ao FrotaWeb..."
     db.commit()
-    return RedirectResponse(url=f"/painel/ordens-servico?msg=O.S.%20{ordem.id}%20colocada%20na%20fila%20de%20envio", status_code=303)
+    processar_ordem_em_fila(ordem.id)
+    db.refresh(ordem)
+    msg = resumo_resultado_envio(ordem.status_envio or "", ordem.retorno_envio or "", f"O.S. {ordem.id} enviada.", f"O.S. {ordem.id} com erro.")
+    return RedirectResponse(url=f"/painel/ordens-servico?msg={requests.utils.quote(msg)}", status_code=303)
 
 
 @app.post("/painel/servicos-os/enviar/{servico_id}")
@@ -2157,10 +2207,13 @@ def enviar_servico(servico_id: int, db: Session = Depends(get_db)):
     if not serv:
         raise HTTPException(status_code=404, detail="Servico nao encontrado")
 
-    serv.status_envio = "EM_FILA"
-    serv.retorno_envio = "Servico colocado na fila de envio. O painel vai processar em segundo plano."
+    serv.status_envio = "PROCESSANDO"
+    serv.retorno_envio = "Enviando servico ao FrotaWeb..."
     db.commit()
-    return RedirectResponse(url=f"/painel/ordens-servico?msg=Servico%20{serv.id}%20colocado%20na%20fila%20de%20envio", status_code=303)
+    processar_servico_em_fila(serv.id)
+    db.refresh(serv)
+    msg = resumo_resultado_envio(serv.status_envio or "", serv.retorno_envio or "", f"Servico {serv.id} enviado.", f"Servico {serv.id} com erro.")
+    return RedirectResponse(url=f"/painel/ordens-servico?msg={requests.utils.quote(msg)}", status_code=303)
 
 
 @app.post("/ordens-servico/{ordem_id}/enviar-frotaweb")
